@@ -1,0 +1,5 @@
+# ETCD config file. YAML format
+
+# on lwa
+#endpoints: ["etcdv3service.lwa.pvt:2379"]
+endpoints: ["10.42.0.64:2379"]

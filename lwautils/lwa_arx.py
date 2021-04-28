@@ -18,6 +18,8 @@ import sys
 import time
 import logging
 import json
+import datetime
+import uuid
 from pathlib import Path
 from pkg_resources import Requirement, resource_filename
 import dsautils.dsa_store as ds
@@ -31,6 +33,9 @@ CMD_KEY_BASE = '/cmd/arx/'
 MON_KEY_BASE = '/mon/arx/'
 # wait for arx board to exec and push to etcd.
 CMD_TIMEOUT = 0.15
+
+# Time between polling for command to show up.
+TEN_ms = 0.010
 
 # Maximum number of analog channels on ARX board
 MAX_CHAN = 16
@@ -46,6 +51,9 @@ FIRST_ATTEN_MASK = 0x01f8
 FIRST_ATTEN_START_BIT = 3
 SECOND_ATTEN_MASK = 0x7e00
 SECOND_ATTEN_START_BIT = 9
+
+MIN_HASH_IDX = 10
+MAX_HASH_IDX = 15
 
 ANLG_ERRORS = {31: "Invalid channel number"}
 
@@ -72,6 +80,23 @@ ONEWIRE_SERIAL_NUMBER_ERRORS = {31: "argument invalid.",
 
 ONEWIRE_TEMP_ERRORS = {31: "no sensors available",
                        32: "unable to read all sensors"}
+def mon_callback(event: dict):
+    """Handles monitor data callbacks for ARX.
+
+    The monitor packet will contain the cmd_id and the function name
+    so the return can be properly parsed.
+
+    Args
+    ----
+    event
+        Dictionary containing monitor data
+
+    """
+    for event in etcd_event.events:
+        key = event.key.decode('utf-8')
+        val = event.value.decode('utf-8')
+        print(key,val)
+
 
 class ARX:
     def __init__(self):
@@ -87,7 +112,48 @@ class ARX:
         self.log.info("Created Arx object")
         self.chan_cfg = MAX_CHAN*[0]
         self.chan_cfg_signal_on = MAX_CHAN*[True]
+        self.cmd_id = ""
+        self.arx_addr = -1
 
+    def _mon_prefix_callback(self, event: list):
+        """Handles monitor data callbacks for ARX.
+
+        The monitor packet will contain the cmd_id and the function name
+        so the return can be properly parsed.
+
+        Args
+        ----
+        event
+            list containing the etcd_key and dictionary containing monitor data
+
+        """
+        if event[0] == '{}{}'.format(MON_KEY_BASE, self.arx_addr):
+            # now look to see if cmd_id matches
+            if event[1]['cmd_id'] == self.cmd_id:
+                self.arx_d = event[1]
+        
+    def _gen_cmd_id(self,) -> str:
+        """Helper to generate a unuque id for command response to ensure
+           clients get the correct response for their command.
+
+        Returns
+        -------
+        str
+           A uniq string for use as a command id
+
+        """
+
+        # The id is created by grabbing the current time in ISO8601 format
+        # which gives us precision and then appends random chars on it using
+        # uuid. The number of chars is specified using MIN_HASH_IDX,
+        # MAX_HASH_IDX.
+        # id = datetime.datetime.now().isoformat()
+        # id += '-' + str(uuid.uuid4())[MIN_HASH_IDX:MAX_HASH_IDX]
+        id = datetime.datetime.now().isoformat()
+        id += '_' + str(uuid.uuid4())[MIN_HASH_IDX:MAX_HASH_IDX]
+        
+        return id
+    
     def _check_time(self, time: int):
         """Helper to check range of time.
 
@@ -173,7 +239,7 @@ class ARX:
         if dev_num < MIN_1WIRE_DEV_COUNT:
             raise ARXE.ArxException("Invalid 1-wire number: {}".format(dev_num))
         
-    def _send(self, arx_addr: int, cmd: str, val: str):
+    def _send(self, arx_addr: int, cmd: str, val: str) -> list:
         """Private helper to send command dictionary to arx board.
 
         Args
@@ -189,11 +255,29 @@ class ARX:
         -------
 
         """
+        self.arx_addr = arx_addr
+        self.cmd_id = self._gen_cmd_id()
+        self.arx_d = None
+        cmd_val = {}
+        cmd_val['val'] = val
+        cmd_val['id'] = self.cmd_id
+        cmd_json = json.dumps(cmd_val)
         cmd_dict = {}
         cmd_dict['cmd'] = cmd
-        cmd_dict['val'] = val
+        cmd_dict['val'] = cmd_json
         key = "{}{}".format(CMD_KEY_BASE, arx_addr)
+
+        watch_id = self.my_store.add_watch_prefix(MON_KEY_BASE,
+                                                  self._mon_prefix_callback)
         self.my_store.put_dict(key, cmd_dict)
+
+        # now wait for dictionary to get populated by callback
+        while self.arx_d is None:
+            time.sleep(TEN_ms)
+        self.my_store.cancel(watch_id)
+        rtn = []
+        rtn.append(self.arx_d)
+        return rtn
 
     def _get(self, arx_addr: str) -> dict:
         """Private helper to get dictionary for an arx board.
@@ -209,7 +293,7 @@ class ARX:
             Dictionary contains value associated with key
 
         """
-        key = "{}{}".format(MON_KEY_BASE,arx_addr)
+        key = "{}/{}".format(MON_KEY_BASE,arx_addr)
         return self.my_store.get_dict(key)
 
     def _sendreceive(self, arx_addr: int, cmd: str, val: str = ''):
@@ -228,11 +312,13 @@ class ARX:
         rtn = []
         
         self._send(arx_addr, cmd, val)
+        
         # wait 150ms for command to be executed
-        time.sleep(CMD_TIMEOUT)
-        arx_d = self._get(arx_addr)
-        print(arx_d)
-        rtn.append(arx_d)
+        #time.sleep(CMD_TIMEOUT)
+
+        #arx_d = self._get(arx_addr)
+        print(self.arx_d)
+        rtn.append(self.arx_d)
         
         return rtn
 
@@ -865,7 +951,8 @@ class ARX:
         
 
         """
-        rtn = self._sendreceive(arx_addr, 'echo', val)
+        key = '{}{}'.format(MON_KEY_BASE, arx_addr)
+        rtn = self._send(arx_addr, 'echo', val)
         return rtn[0]['echo']
 
     def raw(self, arx_addr: int, cmd: str):

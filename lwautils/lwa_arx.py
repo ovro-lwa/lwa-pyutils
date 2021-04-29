@@ -24,7 +24,8 @@ from pathlib import Path
 from pkg_resources import Requirement, resource_filename
 import dsautils.dsa_store as ds
 import dsautils.dsa_syslog as dsl
-import lwautils.ArxException as ARXE 
+import lwautils.ArxException as ARXE
+import lwautils.cmd_rsp as cr
 ETCDCONF = resource_filename(Requirement.parse("lwa-pyutils"),
                              "lwautils/conf/etcdConfig.yml")
 sys.path.append(str(Path('..')))
@@ -99,12 +100,16 @@ def mon_callback(event: dict):
 
 
 class ARX:
-    def __init__(self):
+    def __init__(self, conf: str = None):
         """c-tor. Controls and Monitors ARX boards.
 
         """
         print(ETCDCONF)
-        self.my_store = ds.DsaStore(ETCDCONF)
+        if conf is not None:
+            self.my_store = ds.DsaStore(conf)
+        else:
+            self.my_store = ds.DsaStore(ETCDCONF)
+        self.my_cr = cr.CmdRsp('LWA')
         self.cmd_key_base = CMD_KEY_BASE
         self.mon_key_base = MON_KEY_BASE
         self.log = dsl.DsaSyslogger('lwa', 'arx', logging.INFO, 'Arx')
@@ -114,6 +119,18 @@ class ARX:
         self.chan_cfg_signal_on = MAX_CHAN*[True]
         self.cmd_id = ""
         self.arx_addr = -1
+
+    def _get_atten(self, att: int, mask: int, start_bit: int, val: int) -> int:
+        b = (att ^ 0xFFFF) & 0x3F
+
+        # clear b9:b14
+        val &= ~mask
+
+        # set b9:b14 with b
+        val |= (b << start_bit)
+
+        #print('val: {}, mask: {:016b}, b: {:016b}, fa: {:016b}'.format(val, SECOND_ATTEN_MASK, b, fa))
+        return val
 
     def _mon_prefix_callback(self, event: list):
         """Handles monitor data callbacks for ARX.
@@ -172,7 +189,7 @@ class ARX:
         if time < 0:
             raise ARXE.ArxException("time must be > 0. time= {}".format(time))
         
-    def _check_rtn(self, rtn: dict, errors: dict):
+    def _check_rtn(self, rtn: dict, errors: dict = None):
         """Helper to check errors in rtn
 
         Args
@@ -193,10 +210,15 @@ class ARX:
         if err_msg_json != "":
             try:
                 err = json.loads(err_msg_json)
-                err_msg = "NAK {} - {}".format(err['NAK'], errors[err['NAK']])
             except:
-                raise ARXE.ArxException(err_msg_json)
-            raise ARXE.ArxException(err_msg)
+                raise ARXE.ArxException("Unable to parse json error msg")
+            if errors is not None and err['ERR'] == 'NAK':
+                err_msg = "{} {} - {}".format(err['ERR'], err['MSG'], errors[err['MSG']])
+                raise ARXE.ArxException(err_msg)
+            elif err['ERR'] != 'NAK':
+                err_msg = "{} {}".format(err['ERR'], err['MSG'])
+                raise ARXE.ArxException(err_msg)                    
+            raise ARXE.ArxException(err_msg_json)
 
         return ""
 
@@ -239,7 +261,7 @@ class ARX:
         if dev_num < MIN_1WIRE_DEV_COUNT:
             raise ARXE.ArxException("Invalid 1-wire number: {}".format(dev_num))
         
-    def _send(self, arx_addr: int, cmd: str, val: str) -> list:
+    def _send(self, arx_addr: int, cmd: str, val: str = '') -> list:
         """Private helper to send command dictionary to arx board.
 
         Args
@@ -255,28 +277,13 @@ class ARX:
         -------
 
         """
-        self.arx_addr = arx_addr
-        self.cmd_id = self._gen_cmd_id()
-        self.arx_d = None
-        cmd_val = {}
-        cmd_val['val'] = val
-        cmd_val['id'] = self.cmd_id
-        cmd_json = json.dumps(cmd_val)
-        cmd_dict = {}
-        cmd_dict['cmd'] = cmd
-        cmd_dict['val'] = cmd_json
-        key = "{}{}".format(CMD_KEY_BASE, arx_addr)
 
-        watch_id = self.my_store.add_watch_prefix(MON_KEY_BASE,
-                                                  self._mon_prefix_callback)
-        self.my_store.put_dict(key, cmd_dict)
+        key = '{}{}'.format(MON_KEY_BASE, arx_addr)
+        self.my_cr.set_response_key(key)
+        
+        cmd_key = '{}{}'.format(CMD_KEY_BASE, arx_addr)
+        rtn = self.my_cr.send(cmd_key, cmd, val)
 
-        # now wait for dictionary to get populated by callback
-        while self.arx_d is None:
-            time.sleep(TEN_ms)
-        self.my_store.cancel(watch_id)
-        rtn = []
-        rtn.append(self.arx_d)
         return rtn
 
     def _get(self, arx_addr: str) -> dict:
@@ -295,32 +302,6 @@ class ARX:
         """
         key = "{}/{}".format(MON_KEY_BASE,arx_addr)
         return self.my_store.get_dict(key)
-
-    def _sendreceive(self, arx_addr: int, cmd: str, val: str = ''):
-        """Private helper to send and receive cmds from an ARX board
-
-        Args
-        ----
-        arx_addr
-           Arx board address to send command to.
-        cmd
-           Command to send
-        val
-           Optional arguments for command
-
-        """
-        rtn = []
-        
-        self._send(arx_addr, cmd, val)
-        
-        # wait 150ms for command to be executed
-        #time.sleep(CMD_TIMEOUT)
-
-        #arx_d = self._get(arx_addr)
-        print(self.arx_d)
-        rtn.append(self.arx_d)
-        
-        return rtn
 
     def set_chan_cfg_lowpass_wide(self, chan: int):
         """Set a channel's lowpass filter to wide.
@@ -483,7 +464,7 @@ class ARX:
 
         """
         
-        self.check_channel(chan)
+        self._check_channel(chan)
         self.chan_cfg[chan] |= (1 << 2)
 
     def set_chan_cfg_highpass_narrow(self, chan: int):
@@ -606,13 +587,9 @@ class ARX:
         
         if val < 0 or val > 63:
             raise ARXE.ArxException("Invalid first atten setting: {}".format(val))
-        b = (val ^ 0xFFFF) & 0x3F
-
-        # clear b3:b8 
-        self.chan_cfg[chan] ^= FIRST_ATTEN_MASK
-
-        # set b3:b8 with b
-        self.chan_cfg[chan] |= (b << FIRST_ATTEN_START_BIT)
+        self.chan_cfg[chan] = self._get_atten(val, FIRST_ATTEN_MASK,
+                                              FIRST_ATTEN_START_BIT,
+                                              self.chan_cfg[chan])
 
     def set_chan_cfg_second_atten(self, chan: int, val: int):
         """Set second attenuation value for specified channel in dB
@@ -647,14 +624,10 @@ class ARX:
         if val < 0 or val > 63:
             raise ARXE.ArxException("Invalid first atten setting: {}".format(val))
 
-        # invert atten. control bits.
-        b = (val ^ 0xFFFF) & 0x3F
+        self.chan_cfg[chan] = self._get_atten(val, SECOND_ATTEN_MASK,
+                                              SECOND_ATTEN_START_BIT,
+                                              self.chan_cfg[chan])
 
-        # clear b9:b14
-        self.chan_cfg[chan] ^= SECOND_ATTEN_MASK
-
-        # set b9:b14 with b
-        self.chan_cfg[chan] |= (b << SECOND_ATTEN_START_BIT)
     
     def show_chan_cfg(self, chan: int, verbose: bool = False, cfg: int = None):
         """Show the binary representation of the channel configuration.
@@ -757,9 +730,9 @@ class ARX:
         self._check_channel(chan)
         
         chan_cfg_str = "{:1x}{:04x}".format(chan, self.chan_cfg[chan])
-        rtn = self._sendreceive(arx_addr, 'setc', chan_cfg_str)
+        rtn = self._send(arx_addr, 'setc', chan_cfg_str)
 
-        return self._check_rtn(rtn[0], SET_CHAN_CFG_ERRORS)
+        return self._check_rtn(rtn, SET_CHAN_CFG_ERRORS)
 
 
     def get_chan_cfg(self, arx_addr: int, chan: int) -> int:
@@ -794,9 +767,10 @@ class ARX:
         self._check_channel(chan)
 
         chan_str = "{:1x}".format(chan)
-        rtn = self._sendreceive(arx_addr, 'getc', chan_str)
+        rtn = self._send(arx_addr, 'getc', chan_str)
 
-        return self._check_rtn(rtn[0], SET_CHAN_CFG_ERRORS)
+        self._check_rtn(rtn, SET_CHAN_CFG_ERRORS)
+        return rtn['chan_config'][0]
 
 
     def set_all_chan_cfg(self, arx_addr, chan: int):
@@ -838,9 +812,9 @@ class ARX:
         """
         
         chan_cfg_str = "{:04x}".format(self.chan_cfg[chan])
-        rtn = self._sendreceive(arx_addr, 'seta', chan_cfg_str)
+        rtn = self._send(arx_addr, 'seta', chan_cfg_str)
 
-        return self._check_rtn(rtn[0], SET_ALL_CHAN_CFG_ERRORS)
+        return self._check_rtn(rtn, SET_ALL_CHAN_CFG_ERRORS)
 
     def set_all_different_chan_cfg(self, arx_addr):
         """Sends all configurations defined for each channel to the ARX board.
@@ -879,9 +853,9 @@ class ARX:
         """
 
         chan_cfg_str = ''.join("{:04x}".format(x) for x in self.chan_cfg)
-        rtn = self._sendreceive(arx_addr, 'sets', chan_cfg_str)
+        rtn = self._send(arx_addr, 'sets', chan_cfg_str)
 
-        return self._check_rtn(rtn[0], SET_ALL_DIFFERENT_CHAN_CFG_ERRORS)
+        return self._check_rtn(rtn, SET_ALL_DIFFERENT_CHAN_CFG_ERRORS)
     
     def get_board_id(self, arx_addr: int) -> int:
         """Return ARX board ID.
@@ -903,8 +877,9 @@ class ARX:
 
         """
         
-        rtn = self._sendreceive(arx_addr, 'arxn')
-        return rtn[0]['brd_id']
+        rtn = self._send(arx_addr, 'arxn')
+        self._check_rtn(rtn)
+        return rtn['brd_id']
 
     def get_board_temp(self, arx_addr: int) -> float:
         """Return ARX board temperature in C.
@@ -926,8 +901,9 @@ class ARX:
         
         """
 
-        rtn = self._sendreceive(arx_addr, 'temp')
-        return rtn[0]['brd_temp']
+        rtn = self._send(arx_addr, 'temp')
+        self._check_rtn(rtn)
+        return rtn['brd_temp']
 
     def echo(self, arx_addr: int, val: str) -> str:
         """Return echoed val.
@@ -951,9 +927,10 @@ class ARX:
         
 
         """
-        key = '{}{}'.format(MON_KEY_BASE, arx_addr)
+
         rtn = self._send(arx_addr, 'echo', val)
-        return rtn[0]['echo']
+        self._check_rtn(rtn)
+        return rtn['echo']
 
     def raw(self, arx_addr: int, cmd: str):
         """Return hex byte stream from given command
@@ -970,8 +947,9 @@ class ARX:
 
         """
 
-        rtn = self._sendreceive(arx_addr, 'raw', cmd)
-        return rtn[0]['raw']
+        rtn = self._send(arx_addr, 'raw', cmd)
+        self._check_rtn(rtn)
+        return rtn['raw']
     
 
     def get_time(self, arx_addr: int) -> int:
@@ -994,8 +972,9 @@ class ARX:
 
         """
 
-        rtn = self._sendreceive(arx_addr, 'gtim')
-        return rtn[0]['brd_time_sec']
+        rtn = self._send(arx_addr, 'gtim')
+        self._check_rtn(rtn)
+        return rtn['brd_time_sec']
 
     def set_time(self, arx_addr: int, time: int) -> str:
         """Set the board time in seconds.
@@ -1023,8 +1002,9 @@ class ARX:
         self._check_time(time)
         
         time_str = "{}".format(time)
-        rtn = self._sendreceive(arx_addr, 'stim', time_str)
-        return rtn[0]['err_str']
+        rtn = self._send(arx_addr, 'stim', time_str)
+        self._check_rtn(rtn)
+        return rtn['err_str']
 
     
     def get_chan_voltage(self, arx_addr: int, chan: int) -> int:
@@ -1051,11 +1031,11 @@ class ARX:
 
         self._check_channel(chan)
         chan_str = "{:02x}".format(chan)
-        rtn = self._sendreceive(arx_addr, 'anlg', chan_str)
+        rtn = self._send(arx_addr, 'anlg', chan_str)
 
-        self._check_rtn(rtn[0], ANLG_ERRORS)
+        self._check_rtn(rtn, ANLG_ERRORS)
         
-        return rtn[0]['chan_volts']
+        return rtn['chan_volts']
 
     def load_cfg(self, arx_addr: int, loc: int) -> str:
         """Load config from stored memory location.
@@ -1082,10 +1062,9 @@ class ARX:
         self._check_location(loc)
         loc_str = "{}".format(loc)
 
-        rtn = self._sendreceive(arx_addr, 'load', loc_str)
+        rtn = self._send(arx_addr, 'load', loc_str)
 
-        self._check_rtn(rtn[0], LOAD_ERRORS)
-        return rtn[0]['err_str']
+        return self._check_rtn(rtn, LOAD_ERRORS)
 
     def save_cfg(self, arx_addr: int, loc: int) -> str:
         """Save channel configuration to 1 of 3 memory locations.
@@ -1113,9 +1092,9 @@ class ARX:
         
         loc_str = "{}".format(loc)
 
-        rtn = self._sendreceive(arx_addr, 'save', loc_str)
+        rtn = self._send(arx_addr, 'save', loc_str)
 
-        return self._check_rtn(rtn[0], SAVE_ERRORS)
+        return self._check_rtn(rtn, SAVE_ERRORS)
 
 
     def get_chan_power(self, arx_addr: int, chan: int) -> int:
@@ -1144,10 +1123,10 @@ class ARX:
 
         chan_str = "{:1x}".format(chan)
 
-        rtn = self._sendreceive(arx_addr, 'powc', chan_str)
+        rtn = self._send(arx_addr, 'powc', chan_str)
+        self._check_rtn(rtn)
 
-        self._check_rtn(rtn[0], None)
-        return rtn[0]['chan_power'][0]
+        return rtn['chan_power'][0]
 
     def get_all_chan_power(self, arx_addr: int) -> list:
         """Return power for all ARX channels.
@@ -1168,10 +1147,10 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._sendreceive(arx_addr, 'powa')
+        rtn = self._send(arx_addr, 'powa')
+        self._check_rtn(rtn)
 
-        self._check_rtn(rtn[0], None)
-        return rtn[0]['chan_power']
+        return rtn['chan_power']
 
     def get_chan_current(self, arx_addr: int, chan: int) -> int:
         """Return specified channel current
@@ -1197,10 +1176,10 @@ class ARX:
         self._check_channel(chan)
 
         chan_str = "{:1x}".format(chan)
-        rtn = self._sendreceive(arx_addr, 'curc', chan_str)
+        rtn = self._send(arx_addr, 'curc', chan_str)
+        self._check_rtn(rtn)
 
-        self._check_rtn(rtn[0], None)
-        return rtn[0]['chan_current'][0]
+        return rtn['chan_current'][0]
 
     def get_all_chan_current(self, arx_addr: int) -> list:
         """Return all channel currents
@@ -1221,10 +1200,10 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._sendreceive(arx_addr, 'cura')
+        rtn = self._send(arx_addr, 'cura')
+        self._check_rtn(rtn)
 
-        self._check_rtn(rtn[0], None)
-        return rtn[0]['chan_current']
+        return rtn['chan_current']
 
     def get_board_current(self, arx_addr: int) -> int:
         """Return ARX board current.
@@ -1245,10 +1224,10 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._sendreceive(arx_addr, 'curb')
+        rtn = self._send(arx_addr, 'curb')
+        self._check_rtn(rtn)
 
-        self._check_rtn(rtn[0], None)
-        return rtn[0]['brd_current']
+        return rtn['brd_current']
 
     def search_1wire(self, arx_addr: int) -> int:
         """Search the 1wire buss for devices and returns count.
@@ -1269,10 +1248,10 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._sendreceive(arx_addr, 'owse')
+        rtn = self._send(arx_addr, 'owse')
 
-        self._check_rtn(rtn[0], ONEWIRE_SEARCH_ERRORS)
-        return rtn[0]['1wire_dev_count']
+        self._check_rtn(rtn, ONEWIRE_SEARCH_ERRORS)
+        return rtn['1wire_dev_count']
 
     def get_1wire_count(self, arx_addr: int) -> int:
         """Returns previously found 1wire device count.
@@ -1303,10 +1282,10 @@ class ARX:
 
         """
         
-        rtn = self._sendreceive(arx_addr, 'owdc')
+        rtn = self._send(arx_addr, 'owdc')
+        self._check_rtn(rtn)
 
-        self._check_rtn(rtn[0], None)
-        return rtn[0]['1wire_dev_count']
+        return rtn['1wire_dev_count']
 
     def get_1wire_SN(self, arx_addr: int, dev_num: int) -> int:
         """Return specified 1wire serial number
@@ -1330,10 +1309,10 @@ class ARX:
 
         """
 
-        rtn = self._sendreceive(arx_addr, 'owsn')
+        rtn = self._send(arx_addr, 'owsn')
 
-        self._check_rtn(rtn[0], ONEWIRE_SERIAL_NUMBER_ERRORS)
-        return rtn[0]['1wire_sn']
+        self._check_rtn(rtn, ONEWIRE_SERIAL_NUMBER_ERRORS)
+        return rtn['1wire_sn']
 
     def get_1wire_temp(self, arx_addr: int) -> list:
         """Return temperatures in C for all 1wire devices.
@@ -1355,9 +1334,9 @@ class ARX:
 
         """
 
-        rtn = self._sendreceive(arx_addr, 'owte')
+        rtn = self._send(arx_addr, 'owte')
 
-        self._check_rtn(rtn[0], ONEWIRE_TEMP_ERRORS)
-        return rtn[0]['1wire_temp']
+        self._check_rtn(rtn, ONEWIRE_TEMP_ERRORS)
+        return rtn['1wire_temp']
     
         

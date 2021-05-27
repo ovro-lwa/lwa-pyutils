@@ -31,10 +31,3 @@ Indices and tables
    :undoc-members:
    :inherited-members:
    :show-inheritance:
-
-.. automodule:: lwautils.lwa_arx
-   :members:
-   :undoc-members:
-   :inherited-members:
-   :show-inheritance:
-   

@@ -11,14 +11,15 @@
 
 import sys
 import time
+import copy
 import logging
-import json
 import datetime
 import uuid
 from pathlib import Path
 from pkg_resources import Requirement, resource_filename
 import dsautils.dsa_store as ds
 import dsautils.dsa_syslog as dsl
+import lwautils.TimeoutException as toe
 
 ETCDCONF = resource_filename(Requirement.parse("lwa-pyutils"),
                              "lwautils/conf/etcdConfig.yml")
@@ -30,6 +31,7 @@ MILLISECONDS = 0.001
 # control range of characters to pull out of UUID hash.
 MIN_HASH_IDX = 10
 MAX_HASH_IDX = 15
+
 
 class CmdRsp:
     def __init__(self, project: str = ''):
@@ -49,8 +51,9 @@ class CmdRsp:
         self.cmd_id = None
         self.response_d = None
         self.response_key = None
+        self.user_timeout = 500 * MILLISECONDS
 
-    def _gen_cmd_id(self,) -> str:
+    def _gen_cmd_id(self, ) -> str:
         """Helper to generate a unuque id for command response to ensure
            clients get the correct response for their command.
 
@@ -65,11 +68,11 @@ class CmdRsp:
         # which gives us precision and then appends random chars on it using
         # uuid. The number of chars is specified using MIN_HASH_IDX,
         # MAX_HASH_IDX.
-        id = datetime.datetime.now().isoformat()
-        id += '_' + str(uuid.uuid4())[MIN_HASH_IDX:MAX_HASH_IDX]
-        
-        return id
-        
+        id0 = datetime.datetime.now().isoformat()
+        id0 += '_' + str(uuid.uuid4())[MIN_HASH_IDX:MAX_HASH_IDX]
+
+        return id0
+
     def _mon_prefix_callback(self, event: list):
         """Handles callbacks for command responses
 
@@ -81,6 +84,8 @@ class CmdRsp:
             list containing the etcd_key and dictionary containing response data
 
         """
+        #print('callback: key: {}'.format(event[0]))
+        #print('callback: rsp: {}'.format(event[1]))
         if event[0] == self.response_key:
             # now look to see if cmd_id matches
             if event[1]['id'] == self.cmd_id:
@@ -96,15 +101,19 @@ class CmdRsp:
 
         """
         self.response_key = resp_key
-        
-    def send(self, key: str, cmd: str, val: any = '') -> list:
+
+    def send(self,
+             key: str,
+             cmd: str,
+             val: any = '',
+             timeout: int = 500 * MILLISECONDS) -> list:
         """Send command and payload to etcd.
 
         Note
         ----
         This function uses the following command structure to interact
         with a service connected to Etcd.
-        cmd_d = {'cmd': <cmd>, 'val': {'val': <val>, 'id': <cmd_id>}}
+        cmd_d = {'cmd': <cmd>, 'val': <val>, 'id': <cmd_id>}
 
         The service will rspond with at least the same <cmd_id> of the form:
         resp_d = {'id': <cmd_id>, ...}
@@ -117,7 +126,9 @@ class CmdRsp:
             A command understood by receiving object
         val
             Optional args for command.
-
+        timeout
+            Optional user timeoute for command. Defaults to 500ms
+     
         Returns
         -------
         list
@@ -127,21 +138,31 @@ class CmdRsp:
         self.cmd_id = self._gen_cmd_id()
 
         self.response_d = None
-        cmd_val = {}
-        cmd_val['val'] = val
-        cmd_val['id'] = self.cmd_id
-        cmd_json = json.dumps(cmd_val)
         cmd_dict = {}
         cmd_dict['cmd'] = cmd
-        cmd_dict['val'] = cmd_json
+        cmd_dict['id'] = self.cmd_id
+        val_dict = {}
+        if isinstance(val, dict):
+            val_dict = copy.deepcopy(val)
+        else:
+            val_dict['val'] = val
+        cmd_dict['val'] = val_dict
 
         watch_id = self.my_store.add_watch_prefix(self.response_key,
                                                   self._mon_prefix_callback)
         self.my_store.put_dict(key, cmd_dict)
 
         # now wait for dictionary to get populated by callback
-        while self.response_d is None:
+        # could add a user defined timeout here as well.
+        user_timeout_count = 0
+        user_timeout_count_max = timeout / (10 * MILLISECONDS)
+        while self.response_d is None and user_timeout_count < user_timeout_count_max:
             time.sleep(10 * MILLISECONDS)
-        self.my_store.cancel(watch_id)
-        return self.response_d
+            user_timeout_count += 1
 
+        self.my_store.cancel(watch_id)
+        if self.response_d is None:
+            # Oops, no response from service and user_timeout reached
+            raise toe.TimeoutException("User timeout reached")
+        else:
+            return self.response_d

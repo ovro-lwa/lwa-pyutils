@@ -1,4 +1,4 @@
-""" ARX is a class to encapsulate controlling a LWA ARX board.
+""" ARX is a class to encapsulate controlling LWA ARX boards.
 
     >>> # Example using ARX class
     >>>
@@ -7,9 +7,16 @@
     >>> brd_addr = 2
     >>> try:
     >>>    my_arx = arx.ARX()
-    >>>    brd_temp = my_arx.get_board_temp(brd_addr)
-    >>>    brd_id = my_arx.get_board_id(brd_addr)
-    >>>    echo_rtn = my_arx.echo(brd_addr, "abcdef")
+    >>>    mc_temp = my_arx.get_microcontroller_temp(brd_addr)
+    >>>    # return channel config for channel 0
+    >>>    chan = 0
+    >>>    cfg = my_arx.get_chan_cfg(brd_addr, chan)
+    >>>    print(cfg)
+    >>>    {'sig_on': False, 'narrow_lpf': False, 'narrow_hpf': False,
+    >>>     'first_atten': 0.0, 'second_atten': 0.0, 'dc_on': False}
+    >>>    # Set first_atten to 3.5dB using above cfg dictionary for channel 0
+    >>>    cfg['first_atten'] = 3.5
+    >>>    my_arx.set_chan_cfg(brd_addr, chan, cfg)
     >>> except arxe.ArxException as ae:
     >>>     print(ae)
 """
@@ -18,8 +25,6 @@ import sys
 import time
 import logging
 import json
-import datetime
-import uuid
 from pathlib import Path
 from pkg_resources import Requirement, resource_filename
 import dsautils.dsa_store as ds
@@ -32,8 +37,27 @@ sys.path.append(str(Path('..')))
 
 CMD_KEY_BASE = '/cmd/arx/'
 MON_KEY_BASE = '/mon/arx/'
+RESP_KEY_BASE = '/resp/arx/'
+MILLISECONDS = .001
 # wait for arx board to exec and push to etcd.
-CMD_TIMEOUT = 0.15
+CMD_TIMEOUT = 0.15  # seconds
+USER_TIMEOUT = 500 * MILLISECONDS
+
+# Required channel configuration keys
+SIG_ON = 'sig_on'
+NARROW_LPF = 'narrow_lpf'
+NARROW_HPF = 'narrow_hpf'
+FIRST_ATTEN = 'first_atten'
+SECOND_ATTEN = 'second_atten'
+DC_ON = 'dc_on'
+REQ_CONFIG_KEYS = [
+    SIG_ON, NARROW_LPF, NARROW_HPF, FIRST_ATTEN, SECOND_ATTEN, DC_ON
+]
+
+# attenuations in units of 0.5dB
+ATTEN_SCALE = 0.5
+MIN_ATTENUATION = 0
+MAX_ATTENUATION = 63
 
 # Time between polling for command to show up.
 TEN_ms = 0.010
@@ -42,9 +66,30 @@ TEN_ms = 0.010
 MAX_CHAN = 16
 MIN_CHAN = 0
 
+BRD_ID_LEN = 4
+
+# the scale is (2.0 A/V)*(.004 V/count) = 8 mA per ADC count.
+BOARD_MA_PER_COUNT = 8.0
+MIN_BOARD_CURRENT_COUNT = 0
+# check this value
+MAX_BOARD_CURRENT_COUNT = 4095
+
+# for converstion of chan ADC counts to power
+PWR_COUNTS_PER_VOLT = 5.5
+PWR_LOAD_OHMS = 50.0
+MIN_PWR_COUNT = 0
+# check this value
+MAX_PWR_COUNT = 4095
+
 # Maximum memory location for stored configurations
 MAX_LOC = 3
 MIN_LOC = 0
+
+MIN_BAUD_FACTOR = 1
+MAX_BAUD_FACTOR = 0xFF
+
+MIN_BRD_ADDR = 0x01
+MAX_BRD_ADDR = 0x7F
 
 MIN_1WIRE_DEV_COUNT = 0
 
@@ -58,45 +103,38 @@ MAX_HASH_IDX = 15
 
 ANLG_ERRORS = {31: "Invalid channel number"}
 
-SET_CHAN_CFG_ERRORS = {31: "Invalid argument",
-                       32: "Channel number out of range",
-                       33: "I2C bus timeout",
-                       34: "I2C bus slave failed to acknowledge"}
+SET_CHAN_CFG_ERRORS = {
+    31: "Invalid argument",
+    32: "Channel number out of range",
+    33: "I2C bus timeout",
+    34: "I2C bus slave failed to acknowledge"
+}
 SET_ALL_CHAN_CFG_ERRORS = {31: "The number of argument characters was not 4."}
 
-SET_ALL_DIFFERENT_CHAN_CFG_ERRORS = {31: "The number of argument characters was not 48."}
+SET_ALL_DIFFERENT_CHAN_CFG_ERRORS = {
+    31: "The number of argument characters was not 48."
+}
 
-LOAD_ERRORS = {31: "memory index out of range",
-               32: "no data was stored at that memory index (configuration unchnaged)",
-               33: "I2C bus timeout",
-               34: "I2C bus slave failed to acknowledge"}
+LOAD_ERRORS = {
+    31: "memory index out of range",
+    32: "no data was stored at that memory index (configuration unchnaged)",
+    33: "I2C bus timeout",
+    34: "I2C bus slave failed to acknowledge"
+}
 
-SAVE_ERRORS = {31: "memory index out of range.",
-               32: "write failed."}
+SAVE_ERRORS = {31: "memory index out of range.", 32: "write failed."}
 
 ONEWIRE_SEARCH_ERRORS = {31: "error communicating on 1-wire bus"}
 
-ONEWIRE_SERIAL_NUMBER_ERRORS = {31: "argument invalid.",
-                                32: "argument out of range (>N)."}
+ONEWIRE_SERIAL_NUMBER_ERRORS = {
+    31: "argument invalid.",
+    32: "argument out of range (>N)."
+}
 
-ONEWIRE_TEMP_ERRORS = {31: "no sensors available",
-                       32: "unable to read all sensors"}
-def mon_callback(event: dict):
-    """Handles monitor data callbacks for ARX.
-
-    The monitor packet will contain the cmd_id and the function name
-    so the return can be properly parsed.
-
-    Args
-    ----
-    event
-        Dictionary containing monitor data
-
-    """
-    for event in etcd_event.events:
-        key = event.key.decode('utf-8')
-        val = event.value.decode('utf-8')
-        print(key,val)
+ONEWIRE_TEMP_ERRORS = {
+    31: "no sensors available",
+    32: "unable to read all sensors"
+}
 
 
 class ARX:
@@ -112,13 +150,90 @@ class ARX:
         self.my_cr = cr.CmdRsp('LWA')
         self.cmd_key_base = CMD_KEY_BASE
         self.mon_key_base = MON_KEY_BASE
+        self.resp_key_base = RESP_KEY_BASE
         self.log = dsl.DsaSyslogger('lwa', 'arx', logging.INFO, 'Arx')
         self.log.function('c-tor')
         self.log.info("Created Arx object")
-        self.chan_cfg = MAX_CHAN*[0]
-        self.chan_cfg_signal_on = MAX_CHAN*[True]
+        self.chan_cfg = MAX_CHAN * [0]
+        self.chan_cfg_signal_on = MAX_CHAN * [True]
         self.cmd_id = ""
         self.arx_addr = -1
+
+    def _check_brd_addr(self, brd_addr: int):
+        if brd_addr < MIN_BRD_ADDR or brd_addr > MAX_BRD_ADDR:
+            raise ARXE.ArxException(
+                "Invalid board address: {:02x}".format(brd_addr))
+
+    def _check_baud_factor(self, baud_factor):
+        if baud_factor < MIN_BAUD_FACTOR or baud_factor > MAX_BAUD_FACTOR:
+            raise ARXE.ArxException(
+                "Invalid baud factor: {}".format(baud_factor))
+
+    def _check_config_dict(self, chan_cfg: dict):
+        """Check required keys in dictionary
+        """
+        for key in REQ_CONFIG_KEYS:
+            if key not in chan_cfg:
+                raise ARXE.ArxException(
+                    "Missing configuration key: {}".format(key))
+
+    def _check_attenuation(self, atten: int):
+        if atten < MIN_ATTENUATION or atten > MAX_ATTENUATION:
+            raise ARXE.ArxException("Invalid attenuation: {}".format(atten))
+
+    def _set_local_chan_cfg(self, chan: int, chan_cfg: dict):
+        self._check_config_dict(chan_cfg)
+
+        self._set_chan_cfg_signal_on_state(chan, chan_cfg[SIG_ON])
+
+        if chan_cfg[NARROW_HPF]:
+            self._set_chan_cfg_highpass_narrow(chan)
+        else:
+            self._set_chan_cfg_highpass_wide(chan)
+
+        if chan_cfg[NARROW_LPF]:
+            self._set_chan_cfg_lowpass_narrow(chan)
+        else:
+            self._set_chan_cfg_lowpass_wide(chan)
+
+        atten = int(chan_cfg[FIRST_ATTEN] / ATTEN_SCALE)
+        self._check_attenuation(atten)
+        self._set_chan_cfg_first_atten(chan, atten)
+        atten = int(chan_cfg[SECOND_ATTEN] / ATTEN_SCALE)
+        self._check_attenuation(atten)
+        self._set_chan_cfg_second_atten(chan, atten)
+        if chan_cfg[DC_ON]:
+            self._set_chan_cfg_input_dc_pwr_on(chan)
+        else:
+            self._set_chan_cfg_input_dc_pwr_off(chan)
+
+    def _getBoardSN(self, brd_id: str) -> int:
+        brd_hex_sn = brd_id[:BRD_ID_LEN]
+
+    def _getFirmwareVersion(self, brd_id: int) -> int:
+        brd_hex_sw_ver = brd_id[:BRD_ID_LEN]
+
+    def _convert_chan_power(self, chan_pwr_counts: list) -> float:
+        pwr = []
+        for pwr_c in chan_pwr_counts:
+            if chan_pwr_counts < MIN_PWR_COUNT:
+                raise ARXE.ArxException(
+                    "Channel Power counts < {}".format(MIN_PWR_COUNT))
+            if chan_pwr_counts > MAX_PWR_COUNT:
+                raise ARXE.ArxException(
+                    "Channel Power counts > {}".format(MAX_PWR_COUNT))
+            pwr.append((pwr_c / PWR_COUNTS_PER_VOLT)**2 / PWR_LOAD_OHMS)
+        return pwr
+
+    def _convertBoardCurrent(self, brd_current_counts: int) -> float:
+        if brd_current_counts < MIN_BOARD_CURRENT_COUNT:
+            raise ARXE.ArxException(
+                "Board current counts < {}".format(MIN_BOARD_CURRENT_COUNT))
+        if brd_current_counts > MAX_BOARD_CURRENT_COUNT:
+            raise ARXE.ArxException(
+                "Board current counts > {}".format(MAX_BOARD_CURRENT_COUNT))
+
+        return brd_current_counts * BOARD_MA_PER_COUNT
 
     def _get_atten(self, att: int, mask: int, start_bit: int, val: int) -> int:
         b = (att ^ 0xFFFF) & 0x3F
@@ -129,54 +244,14 @@ class ARX:
         # set b9:b14 with b
         val |= (b << start_bit)
 
-        #print('val: {}, mask: {:016b}, b: {:016b}, fa: {:016b}'.format(val, SECOND_ATTEN_MASK, b, fa))
         return val
 
-    def _mon_prefix_callback(self, event: list):
-        """Handles monitor data callbacks for ARX.
-
-        The monitor packet will contain the cmd_id and the function name
-        so the return can be properly parsed.
-
-        Args
-        ----
-        event
-            list containing the etcd_key and dictionary containing monitor data
-
-        """
-        if event[0] == '{}{}'.format(MON_KEY_BASE, self.arx_addr):
-            # now look to see if cmd_id matches
-            if event[1]['cmd_id'] == self.cmd_id:
-                self.arx_d = event[1]
-        
-    def _gen_cmd_id(self,) -> str:
-        """Helper to generate a unuque id for command response to ensure
-           clients get the correct response for their command.
-
-        Returns
-        -------
-        str
-           A uniq string for use as a command id
-
-        """
-
-        # The id is created by grabbing the current time in ISO8601 format
-        # which gives us precision and then appends random chars on it using
-        # uuid. The number of chars is specified using MIN_HASH_IDX,
-        # MAX_HASH_IDX.
-        # id = datetime.datetime.now().isoformat()
-        # id += '-' + str(uuid.uuid4())[MIN_HASH_IDX:MAX_HASH_IDX]
-        id = datetime.datetime.now().isoformat()
-        id += '_' + str(uuid.uuid4())[MIN_HASH_IDX:MAX_HASH_IDX]
-        
-        return id
-    
-    def _check_time(self, time: int):
+    def _check_time(self, time0: int):
         """Helper to check range of time.
 
         Args
         ----
-        time
+        time0
            Time sent to ARX board
 
         Raises
@@ -186,9 +261,9 @@ class ARX:
 
         """
 
-        if time < 0:
+        if time0 < 0:
             raise ARXE.ArxException("time must be > 0. time= {}".format(time))
-        
+
     def _check_rtn(self, rtn: dict, errors: dict = None):
         """Helper to check errors in rtn
 
@@ -205,7 +280,7 @@ class ARX:
             Contains ARX error messages if any
 
         """
-        
+
         err_msg_json = rtn['err_str']
         if err_msg_json != "":
             try:
@@ -213,11 +288,12 @@ class ARX:
             except:
                 raise ARXE.ArxException("Unable to parse json error msg")
             if errors is not None and err['ERR'] == 'NAK':
-                err_msg = "{} {} - {}".format(err['ERR'], err['MSG'], errors[err['MSG']])
+                err_msg = "{} {} - {}".format(err['ERR'], err['MSG'],
+                                              errors[err['MSG']])
                 raise ARXE.ArxException(err_msg)
             elif err['ERR'] != 'NAK':
                 err_msg = "{} {}".format(err['ERR'], err['MSG'])
-                raise ARXE.ArxException(err_msg)                    
+                raise ARXE.ArxException(err_msg)
             raise ARXE.ArxException(err_msg_json)
 
         return ""
@@ -231,8 +307,8 @@ class ARX:
            ARX Channel number. 0 indexed. MIN_CHAN_NUM <= chan <= MAX_CHAN_NUM
 
         """
-        
-        if chan < MIN_CHAN or chan > MAX_CHAN-1:
+
+        if chan < MIN_CHAN or chan > MAX_CHAN - 1:
             raise ARXE.ArxException("Invalid channel number: {}".format(chan))
 
     def _check_location(self, loc: int):
@@ -245,8 +321,9 @@ class ARX:
 
         """
 
-        if chan < MIN_LOC or chan > MAX_LOC-1:
-            raise ARXE.ArxException("Invalid location number: {}".format(loc))
+        if loc < MIN_LOC or loc > MAX_LOC - 1:
+            raise ARXE.ArxException(
+                "Invalid memory location number: {}".format(loc))
 
     def _check_1wire_device(self, dev_num: int):
         """Helper to check range of 1-wire device count.
@@ -259,9 +336,14 @@ class ARX:
         """
 
         if dev_num < MIN_1WIRE_DEV_COUNT:
-            raise ARXE.ArxException("Invalid 1-wire number: {}".format(dev_num))
-        
-    def _send(self, arx_addr: int, cmd: str, val: str = '') -> list:
+            raise ARXE.ArxException(
+                "Invalid 1-wire number: {}".format(dev_num))
+
+    def _send(self,
+              arx_addr: int,
+              cmd: str,
+              val: str = '',
+              user_timeout: int = USER_TIMEOUT) -> list:
         """Private helper to send command dictionary to arx board.
 
         Args
@@ -272,38 +354,23 @@ class ARX:
             An ARX board command.
         val
             Args if any for ARX command
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
 
         """
 
-        key = '{}{}'.format(MON_KEY_BASE, arx_addr)
+        key = '{}{}'.format(RESP_KEY_BASE, arx_addr)
         self.my_cr.set_response_key(key)
-        
+
         cmd_key = '{}{}'.format(CMD_KEY_BASE, arx_addr)
-        rtn = self.my_cr.send(cmd_key, cmd, val)
+        rtn = self.my_cr.send(cmd_key, cmd, val, user_timeout)
 
         return rtn
 
-    def _get(self, arx_addr: str) -> dict:
-        """Private helper to get dictionary for an arx board.
-
-        Args
-        ----
-        arx_addr
-            ARX board address
-
-        Returns
-        -------
-        dict
-            Dictionary contains value associated with key
-
-        """
-        key = "{}/{}".format(MON_KEY_BASE,arx_addr)
-        return self.my_store.get_dict(key)
-
-    def set_chan_cfg_lowpass_wide(self, chan: int):
+    def _set_chan_cfg_lowpass_wide(self, chan: int):
         """Set a channel's lowpass filter to wide.
 
         Note
@@ -318,18 +385,16 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_lowpass_narrow()
 
-        """        
+        """
         self.chan_cfg[chan] |= 0x01
         if self.chan_cfg_signal_on[chan]:
             self._set_chan_cfg_signal_bit_on(chan)
         else:
             self._set_chan_cfg_signal_bit_off(chan)
 
-    def set_chan_cfg_lowpass_narrow(self, chan: int):
+    def _set_chan_cfg_lowpass_narrow(self, chan: int):
         """Set a channel's lowpass filter to narrow.
 
         Note
@@ -349,21 +414,19 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_lowpass_wide()
 
         """
 
         self._check_channel(chan)
-        
+
         self.chan_cfg[chan] &= ~(1)
         if self.chan_cfg_signal_on[chan]:
             self._set_chan_cfg_signal_bit_on(chan)
         else:
             self._set_chan_cfg_signal_bit_off(chan)
 
-    def set_chan_cfg_signal_on_state(self, chan: int, val: bool = True):
+    def _set_chan_cfg_signal_on_state(self, chan: int, val: bool = True):
         """Set a channel's signal on state.
 
         Note
@@ -385,18 +448,17 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
 
         """
         self._check_channel(chan)
-        
+
         self.chan_cfg_signal_on[chan] = val
         if val:
             self._set_chan_cfg_signal_bit_on(chan)
         else:
             self._set_chan_cfg_signal_bit_off(chan)
-        
+
     def _set_chan_cfg_signal_bit_on(self, chan: int):
         """Helper to set a channel's signal bit to ON.
 
@@ -417,9 +479,7 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_lowpass_narrow()
 
         """
 
@@ -434,9 +494,9 @@ class ARX:
         if b0 == 0:
             self.chan_cfg[chan] |= (1 << 1)
         else:
-            self.chan_cfg[chan] &= ~(1 << 1)            
+            self.chan_cfg[chan] &= ~(1 << 1)
 
-    def set_chan_cfg_highpass_wide(self, chan: int):
+    def _set_chan_cfg_highpass_wide(self, chan: int):
         """Set a channel's highpass filter to wide.
 
         Note
@@ -456,18 +516,14 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_lowpass_narrow()
-        set_chan_cfg_lowpass_wide()
-        set_chan_cfg_highpass_narrow()
 
         """
-        
+
         self._check_channel(chan)
         self.chan_cfg[chan] |= (1 << 2)
 
-    def set_chan_cfg_highpass_narrow(self, chan: int):
+    def _set_chan_cfg_highpass_narrow(self, chan: int):
         """Set a channel's highpass filter to narrow.
 
         Note
@@ -487,17 +543,13 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_lowpass_narrow()
-        set_chan_cfg_lowpass_wide()
-        set_chan_cfg_highpass_wide()
 
         """
         self._check_channel(chan)
         self.chan_cfg[chan] &= ~(1 << 2)
 
-    def set_chan_cfg_input_dc_pwr_on(self, chan: int):
+    def _set_chan_cfg_input_dc_pwr_on(self, chan: int):
         """Set a channel's DC power to ON.
 
         Note
@@ -517,17 +569,15 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_dc_pwr_off()
 
         """
 
         self._check_channel(chan)
-        
+
         self.chan_cfg[chan] |= (1 << 15)
 
-    def set_chan_cfg_input_dc_pwr_off(self, chan: int):
+    def _set_chan_cfg_input_dc_pwr_off(self, chan: int):
         """Set a channel's DC power to OFF.
 
         Note
@@ -547,15 +597,12 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_dc_pwr_on()
 
-        """        
+        """
         self.chan_cfg[chan] &= ~(1 << 15)
-        
 
-    def set_chan_cfg_first_atten(self, chan: int, val: int):
+    def _set_chan_cfg_first_atten(self, chan: int, val: int):
         """Set first attenuation value for specified channel in dB
 
         Args
@@ -577,21 +624,20 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_second_atten()
 
         """
 
         self._check_channel(chan)
-        
+
         if val < 0 or val > 63:
-            raise ARXE.ArxException("Invalid first atten setting: {}".format(val))
+            raise ARXE.ArxException(
+                "Invalid first atten setting: {}".format(val))
         self.chan_cfg[chan] = self._get_atten(val, FIRST_ATTEN_MASK,
                                               FIRST_ATTEN_START_BIT,
                                               self.chan_cfg[chan])
 
-    def set_chan_cfg_second_atten(self, chan: int, val: int):
+    def _set_chan_cfg_second_atten(self, chan: int, val: int):
         """Set second attenuation value for specified channel in dB
 
         Args
@@ -613,23 +659,24 @@ class ARX:
 
         See Also
         --------
-        show_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_first_narrow()
 
         """
 
         self._check_channel(chan)
-        
+
         if val < 0 or val > 63:
-            raise ARXE.ArxException("Invalid first atten setting: {}".format(val))
+            raise ARXE.ArxException(
+                "Invalid first atten setting: {}".format(val))
 
         self.chan_cfg[chan] = self._get_atten(val, SECOND_ATTEN_MASK,
                                               SECOND_ATTEN_START_BIT,
                                               self.chan_cfg[chan])
 
-    
-    def show_chan_cfg(self, chan: int, verbose: bool = False, cfg: int = None):
+    def _show_chan_cfg(self,
+                       chan: int,
+                       verbose: bool = False,
+                       cfg: int = None):
         """Show the binary representation of the channel configuration.
 
         Args
@@ -662,7 +709,7 @@ class ARX:
         b9:b14 = second attenuation (inverted) in steps of 0.5dB Max=63(31.5dB)
 
         b15 = dc power state (1=on, 0=off)
-       
+
         See Also
         --------
         get_chan_cfg()
@@ -671,8 +718,8 @@ class ARX:
         """
 
         self._check_channel(chan)
-        
-        if cfg == None:
+
+        if cfg is None:
             print("{:016b}".format(self.chan_cfg[chan]))
         else:
             print("{:016b}".format(cfg))
@@ -681,11 +728,47 @@ class ARX:
             print("b0 = lowpass filter (1=wide, 0=narrow)")
             print("b1 = signal on when b1 == b0. off otherwise")
             print("b2 = highpass filter (1=wide, 0=narrow)")
-            print("b3:b8 = first attenuation (inverted) in steps of 0.5dB. Max=63(31.5dB)")
-            print("b9:b14 = second attenuation (inverted) in steps of 0.5dB Max=63(31.5dB)")
+            print(
+                "b3:b8 = first attenuation (inverted) in steps of 0.5dB. Max=63(31.5dB)"
+            )
+            print(
+                "b9:b14 = second attenuation (inverted) in steps of 0.5dB Max=63(31.5dB)"
+            )
             print("b15 = dc power state (1=on, 0=off)")
 
-    def set_chan_cfg(self, arx_addr: int, chan: int) -> str:
+    def set_chan_cfg(self,
+                     arx_addr: int,
+                     chan: int,
+                     chan_cfg: dict,
+                     user_timeout: int = USER_TIMEOUT):
+        """Set a channel's configuration.
+
+        Args
+        ----
+        arx_addr
+           ARX board address
+        chan
+           ARX board channel. 0 indexed.
+        chan_cfg
+           Dictionary with following keys:
+           'narrow_lpf': bool, True for narrow LPF, False for 'wide'.
+           'narrow_hpf': bool, True for narrow HPF, False for 'wide'.
+           'first_atten': float, 0.5dB resolution. 0-31.5.
+           'second_atten': float. 0.5dB resolution. 0-31.5.
+           'sig_on': bool, True, False to turn signal off.
+           'dc_on': bool, True. False to turn DC off.
+        user_timeout
+           User defined timeout. Default 500ms
+
+        """
+
+        self._set_local_chan_cfg(chan, chan_cfg)
+        self._set_chan_cfg(arx_addr, chan, user_timeout)
+
+    def _set_chan_cfg(self,
+                      arx_addr: int,
+                      chan: int,
+                      user_timeout: int = USER_TIMEOUT) -> str:
         """Sends the channel configuration to the ARX board.
 
         Args
@@ -694,6 +777,8 @@ class ARX:
             ARX board address
         chan
             The ARX channel to configure. 0 indexed.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Raises
         ------
@@ -713,29 +798,23 @@ class ARX:
 
         See Also
         --------
+        set_chan_cfg()
         set_all_chan_cfg()
         set_all_different_chan_cfg()
-        set_chan_cfg_input_dc_pwr_off()
-        set_chan_cfg_input_dc_pwr_on()
-        set_chan_cfg_lowpass_narrow()
-        set_chan_cfg_lowpass_wide()
-        set_chan_cfg_highpass_narrow()
-        set_chan_cfg_highpass wade()
-        set_chan_cfg_first_atten()
-        set_chan_cfg_second_atten()
-        show_chan_cfg()
 
         """
 
         self._check_channel(chan)
-        
+
         chan_cfg_str = "{:1x}{:04x}".format(chan, self.chan_cfg[chan])
-        rtn = self._send(arx_addr, 'setc', chan_cfg_str)
+        rtn = self._send(arx_addr, 'setc', chan_cfg_str, user_timeout)
 
         return self._check_rtn(rtn, SET_CHAN_CFG_ERRORS)
 
-
-    def get_chan_cfg(self, arx_addr: int, chan: int) -> int:
+    def get_chan_cfg(self,
+                     arx_addr: int,
+                     chan: int,
+                     user_timeout: int = USER_TIMEOUT) -> dict:
         """Return the ARX channel's configuration.
 
         Args
@@ -744,6 +823,86 @@ class ARX:
            ARX board address
         chan
            ARX channel number. 0 indexed
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
+
+        Returns
+        -------
+        dict
+           A dictionary with the following keys:
+           'sig_on':  True if signal is set to on.
+           'narrow_lpf': True. False for wide filter.
+           'narrow_hpf': True. False for wide filter.
+           'first_atten': float 0.5dB resolution. 0-31.5.
+           'second_atten': float 0.5dB resolution. 0-31.5.
+           'dc_on': True if DC is on, False otherwise.
+
+        Raises
+        ------
+        ArxException
+           Any ARX errors.
+
+        See Also
+        --------
+        set_chan_cfg()
+        set_all_chan_cfg()
+        set_all_different_chan_cfg()
+
+        """
+        chan_cfg = self._get_chan_cfg(arx_addr, chan, user_timeout)
+        self._show_chan_cfg(0, chan_cfg)
+        lpf_wide = self._get_lpf(chan_cfg)
+        hpf_wide = self._get_hpf(chan_cfg)
+        sig_on = self._is_sig_on(chan_cfg)
+        first_atten = self._get_first_atten(chan_cfg) * ATTEN_SCALE
+        second_atten = self._get_second_atten(chan_cfg) * ATTEN_SCALE
+        dc_on = self._is_dc_on(chan_cfg)
+
+        rtn = {}
+        rtn[SIG_ON] = sig_on
+        rtn[NARROW_LPF] = (lpf_wide == 0)
+        rtn[NARROW_HPF] = (hpf_wide == 0)
+        rtn[FIRST_ATTEN] = first_atten
+        rtn[SECOND_ATTEN] = second_atten
+        rtn[DC_ON] = dc_on
+
+        return rtn
+
+    def _get_lpf(self, chan_cfg: int) -> int:
+        return chan_cfg & 0x01
+
+    def _get_hpf(self, chan_cfg: int) -> int:
+        return (chan_cfg & (1 << 2)) >> 2
+
+    def _is_sig_on(self, chan_cfg: int) -> bool:
+        lpf = self._get_lpf(chan_cfg)
+        so = (chan_cfg & (1 << 1)) >> 1
+        return so == lpf
+
+    def _get_first_atten(self, chan_cfg: int) -> int:
+        return ((chan_cfg ^ 0xffff) & 0x01f8) >> 3
+
+    def _get_second_atten(self, chan_cfg: int) -> int:
+        return ((chan_cfg ^ 0xffff) & 0x7f00) >> 9
+
+    def _is_dc_on(self, chan_cfg: int) -> bool:
+        dc_on = (chan_cfg & 0x8000) >> 15
+        return dc_on == 1
+
+    def _get_chan_cfg(self,
+                      arx_addr: int,
+                      chan: int,
+                      user_timeout: int = USER_TIMEOUT) -> int:
+        """Return the ARX channel's configuration.
+
+        Args
+        ----
+        arx_addr
+           ARX board address
+        chan
+           ARX channel number. 0 indexed
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -760,20 +919,60 @@ class ARX:
         set_chan_cfg()
         set_all_chan_cfg()
         set_all_different_chan_cfg()
-        show_chan_cfg()
 
         """
 
         self._check_channel(chan)
 
         chan_str = "{:1x}".format(chan)
-        rtn = self._send(arx_addr, 'getc', chan_str)
+        rtn = self._send(arx_addr, 'getc', chan_str, user_timeout)
 
         self._check_rtn(rtn, SET_CHAN_CFG_ERRORS)
         return rtn['chan_config'][0]
 
+    def set_all_chan_cfg(self,
+                         arx_addr: int,
+                         chan_cfg: dict,
+                         user_timeout: int = USER_TIMEOUT):
+        """Sends configuration defined in 'chan_cfg' to all channels on the ARX board.
 
-    def set_all_chan_cfg(self, arx_addr, chan: int):
+        Args
+        ----
+        arx_addr
+           ARX board address.
+        chan_cfg
+           Dictionary with following keys:
+           'narrow_lpf': bool, True for narrow LPF, False for 'wide'.
+           'narrow_hpf': bool, True for narrow HPF, False for 'wide'.
+           'first_atten': float, 0.5dB resolution. 0-31.5.
+           'second_atten': float. 0.5dB resolution. 0-31.5.
+           'sig_on': bool, True, False to turn signal off.
+           'dc_on': bool, True. False to turn DC off.
+
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
+
+        Raises
+        ------
+        ArxException
+           Any ARX errors.
+
+        See Also
+        --------
+        set_chan_cfg()
+        set_all_chan_cfg()
+        set_all_different_chan_cfg()
+
+        """
+
+        chan = 0
+        self._set_local_chan_cfg(chan, chan_cfg)
+        self._set_all_chan_cfg(arx_addr, chan, user_timeout)
+
+    def _set_all_chan_cfg(self,
+                          arx_addr,
+                          chan: int,
+                          user_timeout: int = USER_TIMEOUT):
         """Sends configuration defined for 'chan' to all channels on the ARX board.
 
         Note
@@ -788,7 +987,9 @@ class ARX:
         arx_addr
            ARX board address.
         chan
-           Configuration to send
+           Channel config to use to send to all ARX channels
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Raises
         ------
@@ -797,26 +998,60 @@ class ARX:
 
         See Also
         --------
-        set_all_different_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_input_dc_pwr_off()
-        set_chan_cfg_input_dc_pwr_on()
-        set_chan_cfg_lowpass_narrow()
-        set_chan_cfg_lowpass_wide()
-        set_chan_cfg_highpass_narrow()
-        set_chan_cfg_highpass wade()
-        set_chan_cfg_first_atten()
-        set_chan_cfg_second_atten()
-        show_chan_cfg()
+        set_all_chan_cfg()
+        set_all_different_chan_cfg()
 
         """
-        
+
         chan_cfg_str = "{:04x}".format(self.chan_cfg[chan])
-        rtn = self._send(arx_addr, 'seta', chan_cfg_str)
+        rtn = self._send(arx_addr, 'seta', chan_cfg_str, user_timeout)
 
         return self._check_rtn(rtn, SET_ALL_CHAN_CFG_ERRORS)
 
-    def set_all_different_chan_cfg(self, arx_addr):
+    def set_all_different_chan_cfg(self,
+                                   arx_addr,
+                                   chan_cfgs: list,
+                                   user_timeout: int = USER_TIMEOUT):
+        """Sends configurations defined in chan_cfgs for each channel to the ARX board. 
+
+        Args
+        ----
+        arx_addr
+           ARX board address.
+        chan_cfgs
+           list of dictionaries. list ordered by channel number. dictionary
+           contains keys:
+           'narrow_lpf': True, False for 'wide'.
+           'narrow_hpf': True, False for 'wide'.
+           'sig_on': True to turn sig. on. False for off.
+           'first_atten': float.  0.5 dB resolution. 0-31.5.
+           'second_atten': float 0.5 dB resolution. 0-31.5.
+           'dc_on': True, False for off.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
+
+        Raises
+        ------
+        ArxException
+           Any ARX errors.
+
+        See Also
+        --------
+        set_chan_cfg()
+        set_all_chan_cfg()
+        set_all_different_chan_cfg()
+
+        """
+        [
+            self._set_local_chan_cfg(chan, cfg)
+            for chan, cfg in enumerate(chan_cfgs)
+        ]
+        self._set_all_different_chan_cfg(arx_addr, user_timeout)
+
+    def _set_all_different_chan_cfg(self,
+                                    arx_addr,
+                                    user_timeout: int = USER_TIMEOUT):
         """Sends all configurations defined for each channel to the ARX board.
 
         Note
@@ -830,6 +1065,8 @@ class ARX:
         ----
         arx_addr
            ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Raises
         ------
@@ -838,37 +1075,33 @@ class ARX:
 
         See Also
         --------
-        set_all_chan_cfg()
         set_chan_cfg()
-        set_chan_cfg_input_dc_pwr_off()
-        set_chan_cfg_input_dc_pwr_on()
-        set_chan_cfg_lowpass_narrow()
-        set_chan_cfg_lowpass_wide()
-        set_chan_cfg_highpass_narrow()
-        set_chan_cfg_highpass wade()
-        set_chan_cfg_first_atten()
-        set_chan_cfg_second_atten()
-        show_chan_cfg()
+        set_all_chan_cfg()
+        set_all_differentchan_cfg()
 
         """
 
         chan_cfg_str = ''.join("{:04x}".format(x) for x in self.chan_cfg)
-        rtn = self._send(arx_addr, 'sets', chan_cfg_str)
+        rtn = self._send(arx_addr, 'sets', chan_cfg_str, user_timeout)
 
         return self._check_rtn(rtn, SET_ALL_DIFFERENT_CHAN_CFG_ERRORS)
-    
-    def get_board_id(self, arx_addr: int) -> int:
-        """Return ARX board ID.
+
+    def get_board_id(self,
+                     arx_addr: int,
+                     user_timeout: int = USER_TIMEOUT) -> int:
+        """Return ARX board ID. This is board specific immutable value.
 
         Args
         ----
         arx_addr
             ARX board address
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
         int
-            8bit integer of the ARX board ID
+            16bit integer of the ARX board ID
 
         Raises
         ------
@@ -876,36 +1109,71 @@ class ARX:
            Any arrors with the ARX board.
 
         """
-        
-        rtn = self._send(arx_addr, 'arxn')
+
+        rtn = self._send(arx_addr, 'arxnId', user_timeout)
         self._check_rtn(rtn)
         return rtn['brd_id']
 
-    def get_board_temp(self, arx_addr: int) -> float:
-        """Return ARX board temperature in C.
+    def get_firmware_version(self,
+                             arx_addr: int,
+                             user_timeout: int = USER_TIMEOUT) -> int:
+        """Return firmware version installed on ARX board.
 
         Args
         ----
         arx_addr
             ARX board address
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
-        float
-           ARX board temperature in C.
+        int
+            16bit integer of the firmware version installed on ARX board.
 
         Raises
         ------
         ArxException
            Any arrors with the ARX board.
-        
+
         """
 
-        rtn = self._send(arx_addr, 'temp')
+        rtn = self._send(arx_addr, 'arxnSwVer', user_timeout)
+        self._check_rtn(rtn)
+        return rtn['sw_ver']
+
+    def get_microcontroller_temp(self,
+                                 arx_addr: int,
+                                 user_timeout: int = USER_TIMEOUT) -> float:
+        """Return ARX board's microcontroller temperature in C. Resolution 0.1C
+
+        Args
+        ----
+        arx_addr
+            ARX board address
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
+
+        Returns
+        -------
+        float
+           ARX board's microcontroller temperature in C.
+
+        Raises
+        ------
+        ArxException
+           Any arrors with the ARX board.
+
+        """
+
+        rtn = self._send(arx_addr, 'temp', user_timeout)
         self._check_rtn(rtn)
         return rtn['brd_temp']
 
-    def echo(self, arx_addr: int, val: str) -> str:
+    def echo(self,
+             arx_addr: int,
+             val: str,
+             user_timeout: int = USER_TIMEOUT) -> str:
         """Return echoed val.
 
         Args
@@ -914,6 +1182,8 @@ class ARX:
            ARX board address
         val
            ASCII chacters to be echoed.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -924,21 +1194,28 @@ class ARX:
         ------
         ArxException
            Any arrors with the ARX board.
-        
 
         """
 
-        rtn = self._send(arx_addr, 'echo', val)
+        rtn = self._send(arx_addr, 'echo', val, user_timeout)
         self._check_rtn(rtn)
+        rtn2 = rtn['echo']
+        e_val = rtn2.split("ECHO")[1]
+        if e_val != val:
+            raise ARXE.ArxException(
+                "Echo return do not match sent. Sent= {}, return= {}".format(
+                    val, e_val))
         return rtn['echo']
 
-    def raw(self, arx_addr: int, cmd: str):
+    def raw(self, arx_addr: int, cmd: str, user_timeout: int = USER_TIMEOUT):
         """Return hex byte stream from given command
 
         Args
         ----
         arx_addr
            ARX board address
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Raises
         ------
@@ -947,18 +1224,21 @@ class ARX:
 
         """
 
-        rtn = self._send(arx_addr, 'raw', cmd)
+        rtn = self._send(arx_addr, 'raw', cmd, user_timeout)
         self._check_rtn(rtn)
         return rtn['raw']
-    
 
-    def get_time(self, arx_addr: int) -> int:
+    def _get_time(self,
+                  arx_addr: int,
+                  user_timeout: int = USER_TIMEOUT) -> int:
         """Return the board time since setting.
 
         Args
         ----
         arx_addr
            ARX board address
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -972,20 +1252,24 @@ class ARX:
 
         """
 
-        rtn = self._send(arx_addr, 'gtim')
+        rtn = self._send(arx_addr, 'gtim', user_timeout)
         self._check_rtn(rtn)
         return rtn['brd_time_sec']
 
-    def set_time(self, arx_addr: int, time: int) -> str:
+    def _set_time(self,
+                  arx_addr: int,
+                  time0: int,
+                  user_timeout: int = USER_TIMEOUT) -> str:
         """Set the board time in seconds.
 
         Args
         ----
         arx_addr
             ARX board address.
-
-        time
+        time0
             Represents time in seconds.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -996,26 +1280,35 @@ class ARX:
         ------
         ArxException
            Contains any error messages.
-           
+
         """
 
         self._check_time(time)
-        
-        time_str = "{}".format(time)
-        rtn = self._send(arx_addr, 'stim', time_str)
+
+        time_str = "{}".format(time0)
+        rtn = self._send(arx_addr, 'stim', time_str, user_timeout)
         self._check_rtn(rtn)
         return rtn['err_str']
 
-    
-    def get_chan_voltage(self, arx_addr: int, chan: int) -> int:
-        """Return 16bit digitized voltage from a specified analog channel
+    def get_chan_voltage(self,
+                         arx_addr: int,
+                         chan: int,
+                         user_timeout: int = USER_TIMEOUT) -> int:
+        """Return 16bit digitized voltage from the processor's ADC channel.
+        Range 0:255.
+
+        Note
+        ----
+        Many values are invalid.
 
         Args
         ----
         arx_addr
             ARX board address.
         chan
-            Specifies channel. 0 indexed
+            Specifies the processor's ADC channel number. 0 indexed
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -1031,14 +1324,21 @@ class ARX:
 
         self._check_channel(chan)
         chan_str = "{:02x}".format(chan)
-        rtn = self._send(arx_addr, 'anlg', chan_str)
+        rtn = self._send(arx_addr, 'anlg', chan_str, user_timeout)
 
         self._check_rtn(rtn, ANLG_ERRORS)
-        
+
         return rtn['chan_volts']
 
-    def load_cfg(self, arx_addr: int, loc: int) -> str:
+    def load_cfg(self,
+                 arx_addr: int,
+                 loc: int,
+                 user_timeout: int = USER_TIMEOUT) -> str:
         """Load config from stored memory location.
+
+        Note
+        ----
+        On a power cycle, contents from memory locatation 0 will be loaded.
 
         Args
         ----
@@ -1046,6 +1346,8 @@ class ARX:
             ARX board address.
         loc
            Memory location. Allowed: 0,1 or 2.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -1062,12 +1364,19 @@ class ARX:
         self._check_location(loc)
         loc_str = "{}".format(loc)
 
-        rtn = self._send(arx_addr, 'load', loc_str)
+        rtn = self._send(arx_addr, 'load', loc_str, user_timeout)
 
         return self._check_rtn(rtn, LOAD_ERRORS)
 
-    def save_cfg(self, arx_addr: int, loc: int) -> str:
-        """Save channel configuration to 1 of 3 memory locations.
+    def save_cfg(self,
+                 arx_addr: int,
+                 loc: int,
+                 user_timeout: int = USER_TIMEOUT) -> str:
+        """Save channel configuration to 1 of 3 memory locations. 0 indexed.
+
+        Note
+        ----
+        On a power cycle, contents from memory locatation 0 will be loaded.
 
         Args
         ----
@@ -1075,6 +1384,8 @@ class ARX:
             ARX board address.
         loc
            Memory location. Allowed: 0,1 or 2.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -1089,16 +1400,20 @@ class ARX:
         """
 
         self._check_location(loc)
-        
+
         loc_str = "{}".format(loc)
 
-        rtn = self._send(arx_addr, 'save', loc_str)
+        rtn = self._send(arx_addr, 'save', loc_str, user_timeout)
 
         return self._check_rtn(rtn, SAVE_ERRORS)
 
+    def get_chan_power(self,
+                       arx_addr: int,
+                       chan: int,
+                       user_timeout: int = USER_TIMEOUT) -> float:
+        """Return specified RF rms power at the output of specified channel
+        assuming a 50 Ohm load.
 
-    def get_chan_power(self, arx_addr: int, chan: int) -> int:
-        """Return specified channel power
 
         Args
         ----
@@ -1106,11 +1421,13 @@ class ARX:
             ARX board address.
         chan
            Channel number. 0 indexed
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
-        str
-           Empty string on no errors
+        float
+           Channel power in milliWatts
 
         Raises
         ------
@@ -1118,28 +1435,35 @@ class ARX:
             Any ARX error.
 
         """
-        
+
         self._check_channel(chan)
 
         chan_str = "{:1x}".format(chan)
 
-        rtn = self._send(arx_addr, 'powc', chan_str)
+        rtn = self._send(arx_addr, 'powc', chan_str, user_timeout)
         self._check_rtn(rtn)
 
-        return rtn['chan_power'][0]
+        pwr_counts = rtn['chan_power']
+        pwr = self._convert_chan_power(pwr_counts)
+        return pwr
 
-    def get_all_chan_power(self, arx_addr: int) -> list:
-        """Return power for all ARX channels.
+    def get_all_chan_power(self,
+                           arx_addr: int,
+                           user_timeout: int = USER_TIMEOUT) -> list:
+        """Return RF rms power at the output for all channels
+        assuming a 50 Ohm load.
 
         Args
         ----
         arx_addr
             ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
         list
-           Power for all ARX channels.
+           Power in milliWatts for all ARX channels.
 
         Raises
         ------
@@ -1147,25 +1471,42 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._send(arx_addr, 'powa')
+        rtn = self._send(arx_addr, 'powa', user_timeout)
         self._check_rtn(rtn)
+        pwr_counts = rtn['chan_power']
+        pwr = self._convert_chan_power(pwr_counts)
+        return pwr
 
-        return rtn['chan_power']
+    def get_chan_current(self,
+                         arx_addr: int,
+                         chan: int,
+                         user_timeout: int = USER_TIMEOUT) -> int:
+        """Return specified channel current in millivolts.
+        For coax-connected antennas, this is the current drawn by
+        the FEE and corresonds to 0 - 500mA.
+        For fiber-connected antennas, this is the photodiode current at the ARX
+        board and will be between 0 - 5mA.
+        This current comes from the external 15V power supply.
 
-    def get_chan_current(self, arx_addr: int, chan: int) -> int:
-        """Return specified channel current
+        Note
+        ----
+        This class is not responsible for antenna to type(e.g. coax,fiber)
+        mapping. User applications will take the value from this function and
+        scale appropriately to give the correct current for the antenna.
 
         Args
         ----
         arx_addr
-            ARX board address.
+           ARX board address.
         chan
            Channel number. 0 indexed
+        user_timeout
+           User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
         int
-           Current for specified channel. Units: TBD
+           Current for specified channel.
 
         Raises
         ------
@@ -1175,24 +1516,44 @@ class ARX:
         """
         self._check_channel(chan)
 
+        # For coax-connected antennas, this is the current drawn by the FEE;
+        # a value of 4095 corresponds to 500 mA.  For fiber-connected antnnas,
+        # this is the photodiode current at the ARX board; 4095 corresponds to
+        # 5 mA.
+
         chan_str = "{:1x}".format(chan)
-        rtn = self._send(arx_addr, 'curc', chan_str)
+        rtn = self._send(arx_addr, 'curc', chan_str, user_timeout)
         self._check_rtn(rtn)
 
         return rtn['chan_current'][0]
 
-    def get_all_chan_current(self, arx_addr: int) -> list:
-        """Return all channel currents
+    def get_all_chan_current(self,
+                             arx_addr: int,
+                             user_timeout: int = USER_TIMEOUT) -> list:
+        """Return all channel currents in millivolts.
+        For coax-connected antennas, this is the current drawn by
+        the FEE and corresonds to 0 - 500mA(100mA/V)
+        For fiber-connected antennas, this is the photodiode current at the ARX
+        board and will be between 0 - 5mA(1mA/V)
+        This current comes from the external 15V power supply.
+
+        Note
+        ----
+        This class is not responsible for antenna to type(e.g. coax,fiber)
+        mapping. User applications will take the value from this function and
+        scale appropriately to give the correct current for the antenna.
 
         Args
         ----
         arx_addr
             ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
         list
-           Current for each channel
+           Current for each channel in millivolts.
 
         Raises
         ------
@@ -1200,23 +1561,29 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._send(arx_addr, 'cura')
+        rtn = self._send(arx_addr, 'cura', user_timeout)
         self._check_rtn(rtn)
 
         return rtn['chan_current']
 
-    def get_board_current(self, arx_addr: int) -> int:
-        """Return ARX board current.
+    def get_board_current(self,
+                          arx_addr: int,
+                          user_timeout: int = USER_TIMEOUT) -> int:
+        """Return the total DC current drawn by circuitry on this ARX board.
+        This current comes from the 6V external power supply,
+        regulated to 5V on the board.
 
         Args
         ----
         arx_addr
             ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
         int
-           ARX Board current. Units: TBD
+           ARX Board current. Units: mA
 
         Raises
         ------
@@ -1224,18 +1591,22 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._send(arx_addr, 'curb')
+        rtn = self._send(arx_addr, 'curb', user_timeout)
         self._check_rtn(rtn)
+        brd_current = self._convertBoardCurrent(rtn['brd_currrent'])
+        return brd_current
 
-        return rtn['brd_current']
-
-    def search_1wire(self, arx_addr: int) -> int:
+    def _search_1wire(self,
+                      arx_addr: int,
+                      user_timeout: int = USER_TIMEOUT) -> int:
         """Search the 1wire buss for devices and returns count.
 
         Args
         ----
         arx_addr
             ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -1248,18 +1619,22 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._send(arx_addr, 'owse')
+        rtn = self._send(arx_addr, 'owse', user_timeout)
 
         self._check_rtn(rtn, ONEWIRE_SEARCH_ERRORS)
         return rtn['1wire_dev_count']
 
-    def get_1wire_count(self, arx_addr: int) -> int:
+    def get_1wire_count(self,
+                        arx_addr: int,
+                        user_timeout: int = USER_TIMEOUT) -> int:
         """Returns previously found 1wire device count.
 
         Args
         ----
         arx_addr
             ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Note
         ----
@@ -1276,18 +1651,17 @@ class ARX:
         ArxException
             Any ARX error.
 
-        See Also
-        --------
-        search_1wire()
-
         """
-        
-        rtn = self._send(arx_addr, 'owdc')
+
+        rtn = self._send(arx_addr, 'owdc', user_timeout)
         self._check_rtn(rtn)
 
         return rtn['1wire_dev_count']
 
-    def get_1wire_SN(self, arx_addr: int, dev_num: int) -> int:
+    def _get_1wire_SN(self,
+                      arx_addr: int,
+                      dev_num: int,
+                      user_timeout: int = USER_TIMEOUT) -> int:
         """Return specified 1wire serial number
 
         Args
@@ -1296,6 +1670,8 @@ class ARX:
             ARX board address.
         dev_num
            1wire device number. 0 indexed
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
 
         Returns
         -------
@@ -1309,19 +1685,25 @@ class ARX:
 
         """
 
-        rtn = self._send(arx_addr, 'owsn')
+        rtn = self._send(arx_addr, 'owsn', user_timeout)
 
         self._check_rtn(rtn, ONEWIRE_SERIAL_NUMBER_ERRORS)
-        return rtn['1wire_sn']
+        return rtn['1wire_sn'][dev_num]
 
-    def get_1wire_temp(self, arx_addr: int) -> list:
+    def _get_1wire_temp(self,
+                        arx_addr: int,
+                        user_timeout: int = USER_TIMEOUT) -> list:
         """Return temperatures in C for all 1wire devices.
+        There are N such values, in order of the sensor's index number
+        where N is the number of sensors.
 
         Args
         ----
         arx_addr
             ARX board address.
-        
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
+
         Returns
         -------
         list
@@ -1332,11 +1714,92 @@ class ARX:
         ArxException
             Any ARX error.
 
+        See Also
+        --------
+        get_1wire_count
+
         """
 
-        rtn = self._send(arx_addr, 'owte')
+        rtn = self._send(arx_addr, 'owte', user_timeout)
 
         self._check_rtn(rtn, ONEWIRE_TEMP_ERRORS)
         return rtn['1wire_temp']
-    
-        
+
+    def reset(self, arx_addr: int, user_timeout: int = USER_TIMEOUT):
+        """Reset the processor on the ARX board. The board will reset to its
+        initial state as if the power had been cycled.
+
+        Args
+        ----
+        arx_addr
+           ARX Board address.
+        user_timeout
+           User defined timeout. Default: 500ms
+
+        Raises
+        ------
+        ArxException on any ARX related errors.
+
+        """
+        rtn = self._send(arx_addr, 'rset', user_timeout)
+        self._check_rtn(rtn, None)
+        return ""
+
+    def comm(self,
+             arx_addr: int,
+             new_brd_addr: int,
+             baud_factor: int = None,
+             user_timeout: int = USER_TIMEOUT):
+        """Set the RS485 address and baud rate.
+
+        Note
+        ----
+        Use with caution. Incorrect parameters will cause loss of communication
+        until a manual power cycle.
+
+        Args
+        ----
+        arx_addr
+           ARX Board address.
+        new_brd_addr
+           Single ascii character [0x01,0x7f] other than NULL. Will be set to
+           0x80 + new_brd_addr. Future communication must use this address.
+        baud_factor
+           Unsinged 16b value for setting baud rate = 16*baud_factor Hz.
+           Default: None(No change to baud rate).
+        user_timeout
+           User defined timeout. Default: 500ms
+
+        Raises
+        ------
+        ArxException on any ARX related errors.
+
+        """
+        self._check_brd_addr(new_brd_addr)
+        val = new_brd_addr
+        if baud_factor is not None:
+            self._check_baud_factor(baud_factor)
+            val = '{}{:04x}'.format(val, baud_factor * 16)
+
+        rtn = self._send(arx_addr, 'comm', val, user_timeout)
+        self._check_rtn(rtn, None)
+        return ""
+
+    def last(self, arx_addr: int, user_timeout: int = USER_TIMEOUT):
+        """Return the last command sent to the ARX board.
+
+        Args
+        ----
+        arx_addr
+           ARX Board address.
+        user_timeout
+           User defined timeout. Default: 500ms
+
+        Raises
+        ------
+        ArxException on any ARX related errors.
+
+        """
+        rtn = self._send(arx_addr, 'last', user_timeout)
+        self._check_rtn(rtn, None)
+        return rtn['last']

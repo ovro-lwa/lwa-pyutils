@@ -1,0 +1,61 @@
+Notes on "lwa-pyutils Documentation: Release v0.0.0-1-g3e383bb-dirty" dated Apr 23, 2021
+
+
+Title:  This is entirely about the low-level support of the ARX boards, but one would never know that from the title.
+
+Author:  "LWA collaboration" is pretty obscure.  Please give the actual author(s).
+
+p 3:  "ARX is a class to encapsulate controlling a LWA ARX board."  Why is this in the singular?  There will normally be 45 boards in LWA352, and the design allows for up to 126 boards in a system.  Do you not provide any support for broadcast commands?
+
+=======
+General
+-------  
+The functions in this class seem to map alost 1:1 onto the RS485 commands without providing any additional functionality.  Lots of additional functionality is needed somewhere.  For example:
+- Where is the mapping from (antenna,polarization) to (arxAddress,channel)?  
+- Where does the 16b channel configuration code get parsed into its 4 fields and each field converted to a meaningful value?
+
+The underlying commands are more precisely described in the Command Dictionary (CD) than here, and often you choose to call something by a misleading name.  The CD is the fundamental documentation on how the interface works, but I'm afraid that nobody but you will ever read it.  Everyone else will rely on documents like this one, so a lot of important information will be lost.  For example, the TEMP command returns the internal temperature of the microcontroller on the board.  It is not the "board temperature" as you call it.  Most places on the board are much hotter.  There are many more examples of misleading wording that loses information, to be discussed in connection with the individual functions.
+
+The CD partitions the RS485 commands into "low level utilities" and commands to be used operationally, but you do not make that distinction.  The latter are intended only for maintenance and debugging; You have functions that correspond to some, but not all, of them.  ECHO, ARXN, ANLG, GTIM, STIM, OWSE are supported, but not RSET, COMM or LAST.  ARXN could arguably be moved to the operational subset, but you should remove individual support for all the others; they are accessible via the 'raw()' function.
+
+In the RS485 interface, channels are numbered 0:F so that the value fits in a single hex character.  But all of the hardware documentation, all reports on testing, and all the labels on the boards number the channels 1 through 16.  If these functions are really an API (programmer interface), then I suppose you can retain 0-based numbering here, but in higher-level software, including any user interfaces (whether for scientists or engineers), and in any data written to logs, the channel numbering should be 1-based so that it corresponds to the documentation and labeling.
+
+
+====================
+Individual Functions
+--------------------
+echo().  I suggest deleting this function unless you intend to use it routinely in higher level software to check communication.  Does it check that the returned string is really an echo of what was sent, and raise an exception if not?  Unless it adds such functionality, it is no better than using 'raw(addr,"ECHOhello!")'.
+
+get_1wire_SN().  It's hard to make use of this and I will probably change it in the board software.  You would need a table where all the 1-wire sensor serial numbers are recorded for each board, along with the location of each on the board.  You would then be able to associate the temperature measured by each with a location.  That's pretty messy.  Instead, I hope to work this out during each board's checkout in the lab and record the information in the board's non-volatile memory.  Each OW sensor will then be associated with a channel.  I suggest deleting this function for now.  
+
+get_1wire_temp().  What you don't explain is that the list is in order of sensor number, which is 0 to OWC-1, where OWC is the count returned by 'get_1wire_count()'.  The design allows OWC to be as large as 16, but it will usually be 3 for the boards in LWA352.  Each sensor is associated with one of the signal channels, but the correspondence is random and varies from board to board.  Again, I hope to improve this.
+
+get_all_chan_current(), get_chan_current().  You don't explain what "channel current" means and yuu don't give any units.  This is tricky because both the meaning and the units depend on whether the channel has coax input or fiber input.  At some level of the softare, you need to know which channels are of which type, and make use of that in interpreting this measurement.
+
+get_all_chan_power(), get_chan_power().  You don't say what "power" is being measured, and you don't give any units.  How to convert the raw value to meaningful units should be explained in the CD, but it isn't.  I'll fix that.
+
+get_board_current().  You don't explain what "board current" means.  Units are not TBD; the scale is (2.0 A/V)*(.004 V/count) = 8 mA per ADC count.  This ought to be given in the CD, but it isn't.  I'll fix that.
+
+get_board_id().  This is not an arbitrary "ID".  It is the board's serial number.  It is important to understand that this number is fixed to the physical board forever, allowing it to be tracked for maintenance.  (I hope you saw that the latest board code and CD have the SN as 4 hex digits, and an additional 4 digits are returned for the board software's version number; previously it was just 2 digits, and that's all your simulator returns.  I offered to send an update to the simulator's code, but you didn't respond.)
+
+get_board_temp().  You should explain that this is the internal temperature of the on-board microcontroller.  It is not representative of the overall "board temperature."
+
+get_chan_cfg().  The value returned is not an integer, but rather a bit string with 4 fields.  It would be better to return a 4-element list with the value of each field converted to meaningful units.  Why provide this big set of functions if you're not going to include the functionalities that will always be needed?  
+
+get_chan_voltage().  Presumably this uses the ANLG command, which is a low-level utility that you should not attempt to support.  ANLG is not needed for anything except debugging.  Besides, your description misrepresents it.  Your parameter 'chan' is not the signal channel number as in other commands, but rather the processor's ADC channel number.  These are 0:255, and many values are invalid.  The useful ones are already mapped to other commands by the on-board code, so you never need to use this.
+
+get_time(), set_time().  Delete these.  The board does not have a clock, and it probably never will.  Implementing a meaningful TOD clock is not feasible when the board is subject to power cycles.
+
+load_cfg(), save_cfg().  You should explain that this loads/saves the configurations of all 16 channels.  LOAD is particularly useful as a broadcast command, since it allows configuring the entire system all at once.  It is very important to explain that whatever is stored in loc=0 will be automatically loaded at the next power-up.  That should be the "standard" observing configuration.  The other cells can store alternative configurations, e.g., solar observing mode.
+
+search_1wire().  Delete this function; you should never need it.  The search process is done by the board automatically at power up.  The corresponding command OWSE is for debugging and maintenace only.
+
+set_all_chan_cfg(), set_all_different_chan_cfg(), set_chan_cfg().  Here you introduce the idea of an "internal" configuration without sufficient explanation.  By internal you seem to mean inside the software, not yet sent to hardware; you should say that.  So you're creating a many-step process where other functions (which should be more clearly cross-referenced, not just "see also") must be called to set the configurations in software, and then one of these to send it to the hardware.  How do these functions know whether the internal configuration values have been properly set?  Is there a default value for everything?  How can one tell what has been sent to hardware and what has not?  It would be cleaner to have just one step, where the configurations are arguments to these functions and are immediately sent.
+
+set_chan_cfg_*().  You have 10 functions to manipulate separately the 4 fields of the configuration value.  Nobody will ever want to change one field without knowing the values of the others (and if he wants to do that, he shouldn't), so this might as well be one function with several arguments.  Two functions for each boolean value seems particularly strange.  Terms like "highpass_narrow" are particularly confusing.  You should have one bit that selects either LPF1 or LPF2, and anothe that selects either HPF1 or HPF2.  The user should consult the hardware documentation to find out the cutoff frequency of each filter.
+
+show_chan_cfg().  Is this showing the "internal" configuration that is merely in the software or the actual configuration of the board?  Merely displaying the 16b string in binary seems useful only for debugging the 10 set_chan_cfg_* functions, so it shouldn't be needed here.
+ 
+
+
+

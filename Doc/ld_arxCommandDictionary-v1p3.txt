@@ -1,0 +1,443 @@
+ARX Command Dictionary, rev 1.3 (corresponds to software ver 1.2 [0x0102])
+
+Change log
+2020-03-27:  Initial version, rev 0.0.
+2020-07-08:  Rev 1.0, initial release to project team.  Clarify maximum response length.  Add character format.  Add notes about current developmental implementation.  Add description of wake-up process.
+2020-12-15:  Rev 1.1.  Revise maximum total length of command and response strings from 64 to 80 characters.  Swap command namse SETS and SETA for better pneumonics.  Add commands for 1-wire temperature sensors.
+2021-02-01:  Rev 1.2.  Add long response time for OWSE and OWTE.  Moved OWSE to utility group of commands.  Add error responses for OW?? commands.  Revised LOAD and SAVE to allow choice of 3 memory locations and add error codes.
+2021-02-20:  For SETC, add explanation that attenuator bits are inverted.
+2021-03-15:  SW ver 1.2 (0x0102).  Make address 127 (0x7F, address byte 0xFF) reserved.  GETSN command now returns 16b serial number as hex4 along with hex4 software version.  Add description of RSET command.
+2021-05-15:  Rev 1.3.  Add information about scaling of analog monitor data.  Add note to GTIM,STIM that no clock is implemented and delete time information from LAST.  Corrected response string lengths for POWA and CURA commands.
+
+
+======
+SYNTAX
+------
+
+Analog signal processing is organized into line-replaceable-units (LRUs) which handle 16 signals each.  An LRU is called an Analog Receiver Board (ARX Board).  We need 44 of them to handle the 704 signals from the antennas of LWA352.  Each ARX Board contains control and monitor circuitry to support all 16 of its signals.
+
+Control and monitoring communication is via an RS485 serial bus that is common to all boards, each of which has a unique 8b address.  Communication consists of sending a command string over the bus and receiving a response string over the bus.  Each string consists of ASCII characters, with the following syntax.
+
+Command:  <a><code><arguments><CR>
+where 
+<a> is the 1-byte address of the board.  Its value must be between 0x80 and 0xFE (128 to 254), allowing 127 possible addresses.  This is the only byte in a command or response that is not ASCII, and should be the only one with its MSb set, allowing it to be distinguished as the start of a command. 
+<code> is exactly 4 ASCII characters consisting of upper-case letters and digits.  This defines the command.
+<arguments> is a string of 0 to 74 ASCII characters.  (Maximum length of the complete command message is 80 characters.)  Any character except <CR> is allowed, and the detailed syntax is command-dependent.  In most cases, <arguments> consists of hex digits from the set {0-9,A-F} and is broken into fields representing numerical values.  Numerical values are always sent MSB first.
+
+Commands are ignored by all boards whose address does not match <a>.  If no board has a matching address, no response is returned.  a=0x80 is a special case; no board should match that address, but instead it indicates that the command is addressed to all boards (broadcast).  They should all interpret it and act on it, but no board should send a response.  Broadcasting a command that normally returns meaningful data is probably useless since nothing will be returned, but it is not an error.  Address 0xFF is reserved and should not be used.
+
+Response (success):  <ACK>[<reply>]<CR>
+where
+<ACK> = 0x06 indicates that the command was accepted.
+<reply> can be any ASCII string or the null string, and the detailed syntax is command-dependent, but its maximum length is 78 characters.  (Thus the maximum length of the entire response message, including <ACK> and <CR>, is 80 characters, which is the same as the maximum length of the entire command message.) 
+
+Response (failure):  <NAK><e><f><CR>
+where 
+<NAK> = 0x15 indicates that the command was not accepted;
+<e> is a 1-character generic error code with these meanings:
+1  the command code was not recognized and no action was taken;
+2  the command was too long (80 bytes were received and none was <CR>) and no action was taken (characters after the 80th are ignored until the next <CR> and address byte are received);
+3  the command failed, in which case <f> is a 1-character reason code that is command-dependent.  (When e=1 or 2, f=0.)
+
+All commands are designed to provide a response within 100 ms unless a longer time is given in the description of a particular command.  The RSET command is an exception; it produces no response.  This means that the last response character should be received by the controller no later than 100 ms after it sends the last command character.  If the response is not completed by then, the controller should assume that there will be no further response (e.g., because the address was invalid or because the board with that address has failed) and may begin transmitting the next command.  In the case of a broadcast command, <a>=0x80, the controller should wait 100 ms before sending another command to allow processing to be completed.
+
+RS485 uses asynchronous character transmission.  The baud rate can be varied (see COMM command); the initial rate when boards are delivered will be [TBD].  Each character will be transmitted as 8 bits with no parity, one start bit and one stop bit.
+
+After [TBD] seconds of seeing no activity on the RS485 bus, the processor on each ARX Board will enter a sleep state.  It will awake from sleep when a new character is received, but it may not be able to do so quickly enough to receive that character correctly.  To ensure correct wakeup after extended inactivity, the controller should send an arbitrary character (any ASCII character, with bit 7 clear) and then wait [TBD] ms before sending the first command message.  [The sleep and wakeup feature is not implemented in the developmental board software that is currently available.]
+
+
+======================
+DICTIONARY OF COMMANDS
+----------------------
+
+List of available commands with brief descriptions:
+
+    {"ECHO",echo},               //return a copy of the full command string
+    {"RSET",resetSoft},          //reset the processor
+    {"ARXN",getSN},              //return serial number of this ARX board
+    {"ANLG",getAnalog},          //return reading of specified analog channel
+    {"COMM",setComm},            //set RS485 address and baud rate
+    {"GTIM",getTime},            //get time (seconds)
+    {"STIM",setTime},            //set time (seconds)
+    {"OWSE",find1W},             //find all 1-wire devices (again))
+    {"LAST",lastCommand},        //return a copy of last valid command received
+
+    {"SETC",setChannel},         //configure one signal channel to given value
+    {"GETC",getChannel},         //return current configuration of one signal channel
+    {"SETS",setAllSame},         //configure all signal channels to the same given value
+    {"SETA",setAll},             //configure all signal channels to different given values
+    {"LOAD",loadSettings},       //configure all signal channels to previously stored settings
+    {"SAVE",saveSettings},       //save settings of all signal channels
+    {"POWC",readPowerChannel},   //return total power at output of given chnanel [1]
+    {"POWA",readPowerAll},       //return total power at outputs of all channels [1]
+    {"CURC",readCurrentChannel}, //return FE or PD current for given channel [1]
+    {"CURA",readCurrentAll},     //return FE or PD current for all channels [1]
+    {"CURB",readBoardCurrent},   //return dc current drawn by circuitry on this ARX board [1]
+    {"GETA",readSettings},       //return configurations of all channels
+    {"TEMP",readTemperature},    //return processor's chip temperature  
+    {"OWDC",getOWcount},         //return number of one-wire devices
+    {"OWSN",getOWserialNumber},  //return serial number of a one-wire device
+    {"OWTE",getOWtemperatures},  //return temperatures of OW sensors
+
+The first group of commands ("ECHO" ... "LAST") are low-level utilities intended primarily for testing and debugging.  The remaining commands are intended to be used operationally.
+[1] Value can also be returned via the ANLG command by knowing the appropriate analog channel number.  On the ARX Test Board (but not on the final ARX Boards), 4 analog channels read voltages across thermistors and allow measuring the board temperature at certain locations.
+
+
+ANALOG MONITOR SCALING
+
+Some commands return the results of digitizing analog voltages on the board.  Those commands are:
+  POWA  POWC  CURA  CURC  CURB  ANLG.
+The processor includes a 10b analog-to-digital converter which is set to a range of 0 to 4.096V.  Thus, one ADC count corresponds to 4.000 mV.  All of these commands return results in ADC counts, with a range of 0 to 1023 (0 to 0x3FF).  The ANLG command provides access to each ADC channel for testing or debugging, but all useful ADC channels are more easily read by one of the other commands.  Each measured voltage corresponds in turn to a measurement of RF power or current.  The scalings are explained in the descriptions of the individual commands.  The ADC will always return a value, and the processor has no way to determine whether the value is valid, so they always respond with <ACK>.
+
+The TEMP command also uses the processor's ADC, but with special software to read an internal temperature sensor and convert the result to temperature units.
+
+
+COMMAND DESCRIPTIONS
+
+---------------------------------------------------------------
+ECHO  reply with a copy of the argument string.
+
+syntax:
+<a>ECHO<anystring><CR>
+
+<anystring> is a sequence of up to 74 printable ASCII characters other than <CR>.
+
+response:
+<ACK>ECHO<anystring><CR>
+
+This command should never fail.
+
+---------------------------------------------------------------
+RSET  reset the board's processor
+
+syntax:
+<a>RSET<CR>
+
+This command does not return any response.  The board is reset to its initial state, as if the power had been cycled.
+
+---------------------------------------------------------------
+ARXN  reply with the serial number of the ARX board
+
+syntax:
+<a>ARXN<CR>
+
+response:
+<ACK>hhhhssss<CR>
+
+hhhh is 4 hex digits representing the 16b serial number (0x00 to 0xFF) and
+ssss is 4 hex digits representing the software version code. 
+
+This commmand should never fail.
+
+---------------------------------------------------------------
+ANLG  reply with 16b digitized voltage from a specified analog channel
+
+syntax:
+<a>ANLGhh<CR>
+
+hh is the desired microcontroller analog channel number in hex (2 digits, 0-255).
+(See separate list of valid channel numbers.)
+
+response:
+<ACK>hhhh<CR>
+
+hhhh is the 16b value in HEX (4 digits).  The range is 0 to 0x03FF = 1023.
+
+failure:
+<NAK>31<CR>  Invalid channel number.
+
+---------------------------------------------------------------
+COMM   set RS485 address and baud rate
+
+syntax:
+<a>COMMa[<B>]<CR>
+
+where a is a single ASCII character (anything other than NULL=0)
+      B is a 4-digit hex number giving an unsigned 16b value (optional).
+The RS485 address is set to 0x80+a, so that future commands must start with that value to be recognized.  The baud rate is set to 16*B Hz.  If the second argument is absent, the baud rate is unchanged.
+
+CAUTION:  No check is made of the reasonableness of the arguments.
+
+response:
+<ACK><CR>
+
+This command cannot fail, but giving unreasonable arguments may make future communication impossible until the processor is reset.  Normally this command is used only in the laboratory for inital setup of the board.
+
+---------------------------------------------------------------
+GTIM   get time (seconds)
+STIM   set time (seconds)
+
+syntax:
+<a>GTIM<CR>
+<a>STIMhhhhhhhh<CR>
+
+response:
+<ACK>hhhhhhhh<CR>  (GTIM)
+<ACK><CR>          (STIM)
+
+where hhhhhhhh is 8 hex digits giving a 32b unsigned number.  This is the integer part of the internal clock and is incremented once per second.  For GTIM, the value is returned in the response.  For STIM, the fractional part of the internal clock is cleared and the integer part is set to the given number.  It is recommended that the value be Unix time, seconds since Jan 0 1970.
+
+These commands cannot fail, but if fewer than 8 hex digits are given for STIM then the clock is set to an unpredictable value.
+
+As of software version 1.2, no clock is implented on the board so these commands are not useful.  GTIM will return the last value written by STIM; the value is never incremented.
+
+---------------------------------------------------------------
+LAST    return a copy of last valid command received
+
+syntax:
+<a>LAST<CR>
+
+response:
+<ACK><string>CR>
+
+where 
+<string> is usually the entire content of the last valid command, excluding only the final <CR>.  It includes the address byte <a> from that command with its MSB cleared; this allows distinguishing a broadcast command (a=0x80) from an individual-board command.  If there was no previous valid command (e.g., if LAST was the first valid command after a power cycle or reset) then <string> is empty.  If the entire response message would be longer than 64 characters, then <string> is truncated to 54 characters.
+
+This command can be used to verify that a broadcast command was actually received, since the broadcast provides no acknowledgment.  
+
+---------------------------------------------------------------
+SETC      configure one signal channel to given value
+
+syntax:
+<a>SETCnvvvv<CR>
+
+where n is the channel number within this board as one hex digit (0:F);
+      vvvv is the 16b configuration number of the channel, as 4 hex digits.
+
+The configuration number is decoded as follows.
+b0    lowpass filter selection 1=wide, 0=narrow.
+b1    ==b0 for normal operation, !=b0 for signal off.
+b2    highpass filter selection, 1=wide, 0=narrow.
+b3:8  first attenuator setting (inverted*), 0:0.5:31.5 dB.
+b9:14 second attenuator setting (inverted*), 0:0.5:31.5 dB.
+b15   input DC power (0=off, 1=on).
+
+*Note:  Attenuator control bits are inverted.  For example, in C:  
+   B = (attn ^ 0xFFFF) & 0x3F;
+where attn is desired attenuation in units of 0.5dB as UINT16, and B is the 6-bit value to use in the appropriate field (b3:8 or b9:14).
+
+response:
+<ACK><CR>    Success.
+<NAK>31<CR>  Invalid argument
+<NAK>32<CR>  Channel number out of range
+<NAK>33<CR>  I2C bus timeout
+<NAK>34<CR>  I2C bus slave failed to acknowledge
+
+---------------------------------------------------------------
+GETC      return the configuration of one signal channel
+
+syntax:
+<a>GETCn<CR>
+
+where n is the channel number within this board as one hex digit (0:F);
+
+response:
+<ACK>vvvv<CR>    Success.  See SETC command for decoding of vvvv.
+<NAK>31<CR>  Invalid argument
+<NAK>32<CR>  Channel number out of range
+<NAK>33<CR>  I2C bus timeout
+<NAK>34<CR>  I2C bus slave failed to acknowledge
+
+---------------------------------------------------------------
+SETS     configure all signal channels to the same given value
+
+syntax:
+<a>SETAvvvv<CR>
+
+where vvvv is the 16b configuration number (same meaning as in SETC).  The same configuration is  applied to all 16 channels of the board.  If this command is broadcast, all channels of the entire array are set to the same configuration.
+
+response:
+<ACK><CR>    Success.
+<NAK>31<CR>  The number of argument characters was not 4.
+
+---------------------------------------------------------------
+SETA     configure all signal channels to different given values
+
+syntax:
+<a>SETSvvvv...vvvv<CR>
+
+where the argument string is 48 characters in 16 fields of 4 each, giving the configuration numbers for each of the 16 channels of the board, starting with channel 0.  Each configuration number has the same meaning as in SETC.
+
+response:
+<ACK><CR>    Success.
+<NAK>31<CR>  The number of argument characters was not 48.
+
+---------------------------------------------------------------
+LOAD       configure all signal channels to previously stored settings
+
+syntax:
+<a>LOADn<CR>
+where n='0', '1', or '2' is a single-character index to non-volatile memory.
+
+Read the configuration numbers for all 16 channels from on-board non-volatile memory and configure all channels accordingly.  This command can be broadcast.
+
+response:
+<ACK><CR>    success
+<NAK>31<CR>  memory index out of range
+<NAK>32<CR>  no data was stored at that memory index (configuration unchnaged)
+<NAK>33<CR>  I2C bus timeout
+<NAK>34<CR>  I2C bus slave failed to acknowledge
+
+
+---------------------------------------------------------------
+SAVE      save settings of all signal channels
+
+syntax:
+<a>SAVEn<CR>
+where n='0', '1', or '2' is a single-character index to non-volatile memory.
+
+Write the current configuration numbers of all channels to on-board non-volatile memory.  This command can be broadcast.  The values in cell 0 will be automatically loaded at the next power cycle or reset.
+
+response:
+<ACK><CR>      success
+<NAK>31<CR>    memory index out of range
+<NAK>32<CR>    write failed.  
+
+---------------------------------------------------------------
+POWC    return total RF power at output of given chnanel
+
+syntax:
+<a>POWCn<CR>
+where n is the channel number as one hex digit.
+
+response:
+<ACK>vvvv<CR>
+where vvvv is a 16b unsigned integer as 4 hex digits, proportional to the RF rms voltage at the output of channel n.  The value is in ADC counts, and there is an analog voltage gain of 5.5 before the ADC.  The measured voltage V can be converted to power as
+
+    P = (V/5.5)^2/R
+
+where R = 50 ohms assumed to be the load impedance at the output of the channel.
+
+This command cannot fail.
+
+---------------------------------------------------------------
+POWA     return total power at output of all channels
+
+syntax:
+<a>POWA<CR>
+
+response:
+<ACK>vvvv....vvvv<CR>
+where the response string is 64 characters long, in 16 fields of 4-digit hex values, where each is a 16b unsigned integer proportional to the rms voltage at the output of one channel, starting with channel 0.  See POWC for discussion of scaling.
+
+This command cannot fail.
+
+---------------------------------------------------------------
+CURC      return FE or PD current for given channel
+
+syntax:
+<a>CURCn<CR>
+where n is the channel number as one hex digit.
+
+response:
+<ACK>vvvv<CR>
+where vvvv is a 16b unsigned integer as 4 hex digits, proportional to the DC current at the input of channel n.  For coax-connected antennas, this is the current drawn by the FEE; the scale is 100 mA/V.  For fiber-connected antnnas, this is the photodiode current at the ARX board; the scale is then 1.0 mA/V .  This current comes from the external 15V power supply.
+
+This command cannot fail.
+
+---------------------------------------------------------------
+CURA       return FE or PD current for all channels
+
+syntax:
+<a>CURA<CR>
+
+response:
+<ACK>vvvv....vvvv<CR>
+where the response string is 64 characters long, in 16 fields of 4-digit hex values, where each is a 16b unsigned integer proportional to the current at the input of one channel, starting with channel 0.  Scaling is the same as for CURC.
+
+This command cannot fail.
+
+---------------------------------------------------------------
+CURB       return dc current drawn by circuitry on this ARX board
+
+syntax:
+<a>CURB<CR>
+
+response:
+<ACK>vvvvCR>
+where vvvv is a 16b unsigned number as 4 hex digits, proportional the total DC current drawn by circuitry on this ARX board.  This current comes from the external 6V external power supply, regulated to 5V on the board.  The scale is 2000 mA/V.  
+
+---------------------------------------------------------------
+GETA      return configurations of all channels
+
+syntax:
+<a>GETA<CR>
+
+response:
+<ACK>vvvv....vvvv<CR>
+where the response string is 64 characters long, in 16 fields of 4-digit hex values, where each is the 16b configuration number of one channel, starting with channel 0.  Decoding is the same as for SETC.  If retrieving the value from any channel fails, the value is replaced by 0xFFFF.
+
+This command cannot fail.
+
+---------------------------------------------------------------
+TEMP        return processor's chip temperature
+
+syntax:
+<a>TEMP<CR>
+
+response:
+<ACK><a>vvvv<CR>
+where vvvv is a 16b unsigned integer as 4 hex digits, representing the internal chip temperature of the microcontroller on the board.  The value is in units of 0.1C.
+
+---------------------------------------------------------------
+OWSE        find all 1-wire devices (again))
+
+Searches for devices on the 1-wire sensor bus.  Each board can have 0 to 16 1-wire temperature sensors.  Running this command should not be necessary, since it is done automatically at startup.  See also the OWDC command for getting the number of devices.  
+
+This command may take up to 1000 ms to return a response.
+
+syntax:
+<a>OWSE<CR>
+(No arguments.)
+
+response:
+<ACK><a>vv<CR>
+where vv is an 8b unsigned integer as 2 hex digits, representing the number of 1-wire devices found.
+<NAK>31    error communicating on 1-wire bus
+
+---------------------------------------------------------------
+OWDC        return number of 1-wire devices
+
+Returns the previously-stored value of the number of devices on the 1-wire sensor bus.
+
+syntax:
+<a>OWDC<CR>
+(No arguments.)
+
+response:
+<ACK>vv<CR>
+where vv is an 8b unsigned integer as 2 hex digits, representing the number of 1-wire devices found.
+
+This command cannot fail.
+
+---------------------------------------------------------------
+OWSN         return serial number of a one-wire device
+
+syntax:
+<a>OWDCn<CR>
+where n is an index number (0 to N-1, where N is the number of 1-wire devices) as 1 hex digit.
+
+response:
+<ACK>vvvvvvvvvvvvvvvv<CR>
+where vvvvvvvvvvvvvvvv is the 64-bit serial number as 16 hex digits, MSB first.  Each 1-wire devie has a unique hardware serial number.
+<NAK>31  argument invalid
+<NAK>32  argument out of range (>N).  
+
+---------------------------------------------------------------
+OWTE         return temperatures of OW sensors
+
+Get temperatures of all 1-wire temperature sensors.  The Rev H boards can have up to 16 of these sensors, but usually fewer will be installed.  
+
+This command takes from ~100 ms to several hundred ms to return a response, depending on how many 1-wire sensors are installed.
+
+syntax:
+<a>OWTE<CR>
+(No arguments.)
+
+response:
+<ACK>vvvv...vvvv<CR>
+where vvvv is a 16b integer as 4 hex digits, representing measured temperature as a signed 12b number in units of .0625 C (4b after binary point).  There are N such values, in order of the sensor's index number (see OWSN), where N is the number of sensors.
+<NAK>31   no sensors available
+<NAK>32   unable to read all sensors
+
+---------------------------------------------------------------

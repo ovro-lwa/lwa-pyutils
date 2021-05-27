@@ -77,7 +77,7 @@ master_doc = 'index'
 # General information about the project.
 project = u'lwa-pyutils'
 copyright = u'2020, LWA Collaboration'
-author = u'LWA Collaboration'
+author = u'Rick Hobbs'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -255,7 +255,7 @@ latex_elements = {
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
     (master_doc, 'lwa-pyutils.tex', u'lwa-pyutils Documentation',
-     u'LWA Collaboration', 'manual'),
+     u'Rick Hobbs', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of

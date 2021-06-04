@@ -2,25 +2,19 @@
 
 # run arx tests
 
-ARX=0
-SNAP=1
+ARX=1
+SNAP=0
 if [[ $ARX == 1 ]]; then
-    pytest -m 'serial0'
-    pytest -m 'serial1'
-    pytest -m 'serial2'
-    pytest -m 'serial3'
-    pytest -m 'serial4'
-    pytest -m 'serial5'
-    pytest -m 'serial6'
-    pytest -m 'serial7'
-    pytest -m 'serial8'
-    pytest -m 'serial9'
-    pytest -m 'fatten'
-    pytest -m 'satten'
-    pytest -m 'sattenARX'
-    pytest -m 'fattenARX'
-    pytest -m 'serialLPNARX'
-    pytest -m 'serialLPWARX'
+#    pytest -m 'chanshort'
+    pytest -m 'chanpower' test_arx.py
+    pytest -m 'chancurrent' test_arx.py
+    pytest -m 'chanvoltage' test_arx.py
+    pytest -m 'allchanpower' test_arx.py
+    pytest -m 'allchancurrent' test_arx.py
+    pytest -m 'badchannel' test_arx.py
+    pytest -m 'serial7' test_arx.py
+    pytest -m 'serial8' test_arx.py
+    pytest -m 'serial6' test_arx.py
 fi
 
 # SNAP tests

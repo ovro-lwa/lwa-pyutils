@@ -161,7 +161,7 @@ class CmdRsp:
             user_timeout_count += 1
 
         self.my_store.cancel(watch_id)
-        if self.response_d is None:
+        if cmd != 'rset' and self.response_d is None:
             # Oops, no response from service and user_timeout reached
             raise toe.TimeoutException("User timeout reached")
         else:

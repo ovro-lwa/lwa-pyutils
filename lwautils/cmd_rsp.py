@@ -145,7 +145,7 @@ class CmdRsp:
         if isinstance(val, dict):
             val_dict = copy.deepcopy(val)
         else:
-            val_dict['val'] = val
+            val_dict['val'] = str(val)
         cmd_dict['val'] = val_dict
 
         watch_id = self.my_store.add_watch_prefix(self.response_key,
@@ -153,7 +153,6 @@ class CmdRsp:
         self.my_store.put_dict(key, cmd_dict)
 
         # now wait for dictionary to get populated by callback
-        # could add a user defined timeout here as well.
         user_timeout_count = 0
         user_timeout_count_max = timeout / (10 * MILLISECONDS)
         while self.response_d is None and user_timeout_count < user_timeout_count_max:

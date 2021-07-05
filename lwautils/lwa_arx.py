@@ -75,8 +75,15 @@ MIN_BOARD_CURRENT_MA = 0
 # check this value
 MAX_BOARD_CURRENT_MA = 5000
 
+# millivolt/count
+MVOLT_PER_COUNT = 4
+# coax milliamp/volt conversion factor
+COAX_MA_PER_VOLT = 100
+# fiber milliamp/volt conversion factor
+FIBER_MA_PER_VOLT = 1
+
 # for converstion of chan ADC counts to power
-PWR_COUNTS_PER_VOLT = 5.5
+PWR_COUNTS_PER_VOLT = 2.296
 PWR_LOAD_OHMS = 50.0
 MIN_PWR_COUNT = 0
 # check this value
@@ -90,7 +97,7 @@ MIN_BAUD_FACTOR = 1
 MAX_BAUD_FACTOR = 0xFF
 
 MIN_BRD_ADDR = 0x01
-MAX_BRD_ADDR = 0x7F
+MAX_BRD_ADDR = 0x7e
 
 MIN_1WIRE_DEV_COUNT = 0
 
@@ -110,10 +117,16 @@ SET_CHAN_CFG_ERRORS = {
     33: "I2C bus timeout",
     34: "I2C bus slave failed to acknowledge"
 }
-SET_ALL_CHAN_CFG_ERRORS = {31: "The number of argument characters was not 4."}
+SET_ALL_CHAN_CFG_ERRORS = {
+    31: "The number of argument characters was not 4.",
+    33: "I2C bus timeout",
+    34: "I2C bus slave failed to acknowledge"
+}
 
 SET_ALL_DIFFERENT_CHAN_CFG_ERRORS = {
-    31: "The number of argument characters was not 48."
+    31: "The number of argument characters was not 64.",
+    33: "I2C bus timeout",
+    34: "I2C bus slave failed to acknowledge"
 }
 
 LOAD_ERRORS = {
@@ -137,6 +150,11 @@ ONEWIRE_TEMP_ERRORS = {
     32: "unable to read all sensors"
 }
 
+COMM_ERRORS = {
+    31: "Invalid address (not 1 to 126)",
+    32: "Argument contains a non-hex character",
+    33: "Attempt to change baud rate failed"
+}
 
 class ARX:
     def __init__(self, conf: str = None):
@@ -161,6 +179,10 @@ class ARX:
         self.arx_addr = -1
         self.brd_sn = None
         self.sw_ver = None
+        self.input_coupling = None
+        self.onewire_temp_count = None
+        self.onewire_temp_chan_map = None
+
 
     def _check_brd_addr(self, brd_addr: int):
         if brd_addr < MIN_BRD_ADDR or brd_addr > MAX_BRD_ADDR:
@@ -384,7 +406,7 @@ class ARX:
         set_chan_cfg()
 
         """
-        self.chan_cfg[chan] |= 0x01
+        self.chan_cfg[chan] &= ~(1)
         if self.chan_cfg_signal_on[chan]:
             self._set_chan_cfg_signal_bit_on(chan)
         else:
@@ -416,7 +438,7 @@ class ARX:
 
         self._check_channel(chan)
 
-        self.chan_cfg[chan] &= ~(1)
+        self.chan_cfg[chan] |= 0x01
         if self.chan_cfg_signal_on[chan]:
             self._set_chan_cfg_signal_bit_on(chan)
         else:
@@ -517,7 +539,8 @@ class ARX:
         """
 
         self._check_channel(chan)
-        self.chan_cfg[chan] |= (1 << 2)
+        # 1=narrow, 0=wide. 
+        self.chan_cfg[chan] &= ~(1 << 2)
 
     def _set_chan_cfg_highpass_narrow(self, chan: int):
         """Set a channel's highpass filter to narrow.
@@ -543,7 +566,8 @@ class ARX:
 
         """
         self._check_channel(chan)
-        self.chan_cfg[chan] &= ~(1 << 2)
+        # 1=narrow, 0=wide. 
+        self.chan_cfg[chan] |= (1 << 2)
 
     def _set_chan_cfg_input_dc_pwr_on(self, chan: int):
         """Set a channel's DC power to ON.
@@ -1205,15 +1229,18 @@ class ARX:
         else:
             brd_dict = self.get_board_info(arx_addr,
                                            user_timeout)
-            self.brd_sn = brd_dict['brd_sn']
-            self.sw_ver = brd_dict['sw_ver']
             return self.brd_sn
 
     def get_board_info(self,
                      arx_addr: int,
                      user_timeout: int = USER_TIMEOUT) -> dict:
-        """Return ARX board serial number and software version.
-        The serial number is a board specific immutable value.
+        """Return following information from an ARX board:
+           serial number, software version string, input_coupling array
+           and the number of known temperature sensors.
+           The serial number is a board specific immutable value.
+           The input_coupling array is of length 16 and whose element
+           index represents the channel index. A vaule 0 represents a coax
+           coupled antenna and a 1 represents a fiber coupled antenna.
 
         Args
         ----
@@ -1226,7 +1253,8 @@ class ARX:
         -------
         dict
             Dictionary with the following keys:
-            'brd_sn' and 'sw_ver'
+            'brd_sn', 'sw_ver', 'input_coupling', '1wire_temp_count',
+            '1wire_temp_chan_map'
 
         Raises
         ------
@@ -1239,9 +1267,15 @@ class ARX:
         self._check_rtn(rtn)
         self.brd_sn = rtn['brd_id']
         self.sw_ver = rtn['sw_ver']
+        self.input_coupling = rtn['input_coupling']
+        self.onewire_temp_count = rtn['1wire_temp_count']
+        self.onewire_temp_chan_map = rtn['1wire_temp_chan_map']
         rtn_d = {}
         rtn_d['brd_sn'] = self.brd_sn
         rtn_d['sw_ver'] = self.sw_ver
+        rtn_d['input_coupling'] = self.input_coupling
+        rtn_d['1wire_temp_count'] = self.onewire_temp_count
+        rtn_d['1wire_temp_chan_map'] = self.onewire_temp_chan_map
         return rtn_d
                        
     def get_board_id(self,
@@ -1270,14 +1304,7 @@ class ARX:
 
         """
 
-        if self.brd_sn != None:
-            return self.brd_sn
-        else:
-            brd_dict = self.get_board_info(arx_addr,
-                                           user_timeout)
-            self.brd_sn = brd_dict['brd_sn']
-            self.sw_ver = brd_dict['sw_ver']
-            return self.brd_sn
+        return get_board_sn(arx_addr, user_timeout)
 
     def get_firmware_version(self,
                              arx_addr: int,
@@ -1308,8 +1335,6 @@ class ARX:
         else:
             brd_dict = self.get_board_info(arx_addr,
                                            user_timeout)
-            self.brd_sn = brd_dict['brd_sn']
-            self.sw_ver = brd_dict['sw_ver']
             return self.sw_ver
 
     def get_microcontroller_temp(self,
@@ -1371,7 +1396,7 @@ class ARX:
         self._check_rtn(rtn)
         rtn2 = rtn['echo']
         e_val = rtn2.split("ECHO")[1]
-        if e_val != val:
+        if e_val != str(val):
             raise ARXE.ArxException(
                 "Echo return do not match sent. Sent= {}, return= {}".format(
                     val, e_val))
@@ -1465,7 +1490,8 @@ class ARX:
                          chan: int,
                          user_timeout: int = USER_TIMEOUT) -> int:
         """Return 16bit digitized voltage from the processor's ADC channel.
-        Range 0:255.
+        Range 0:255. Note: these channels are not necessarily equal to the
+        16 signal channels.
 
         Note
         ----
@@ -1483,7 +1509,7 @@ class ARX:
         Returns
         -------
         int
-            Digitized voltage as a 16bit value.
+            Digitized voltage as a 16bit value in volts.
 
         Raises
         ----------
@@ -1498,7 +1524,7 @@ class ARX:
 
         self._check_rtn(rtn, ANLG_ERRORS)
 
-        return rtn['chan_adc_millivolts']
+        return rtn['chan_adc_millivolts']/1000.
 
     def load_cfg(self,
                  arx_addr: int,
@@ -1616,7 +1642,7 @@ class ARX:
         pwr_watts = []
         for pwr in rtn['chan_microwatts']:
             pwr_watts.append(pwr*1e-6)
-        return pwr_watts
+        return pwr_watts[0]
 
     def get_all_chan_power(self,
                            arx_addr: int,
@@ -1650,10 +1676,10 @@ class ARX:
             pwr_watts.append(pwr*1e-6)
         return pwr_watts
 
-    def get_chan_current(self,
-                         arx_addr: int,
-                         chan: int,
-                         user_timeout: int = USER_TIMEOUT) -> int:
+    def _get_chan_current_adc(self,
+                              arx_addr: int,
+                              chan: int,
+                              user_timeout: int = USER_TIMEOUT) -> int:
         """Return specified channel current in adc counts.
         For coax-connected antennas, this is the current drawn by
         the FEE; the scale is 100 mA / V.
@@ -1701,6 +1727,79 @@ class ARX:
 
         return rtn['chan_current_adc'][0]
 
+    def _adc2volts(self, adc: int) -> float:
+        return adc * MVOLT_PER_COUNT / 1000.
+
+    def _volts2Amps(self, volts: float, coupling: int) -> float:
+        if 0 == coupling:
+            return volts * COAX_MA_PER_VOLT / 1000.
+        else:
+            return volts * FIBER_MA_PER_VOLT / 1000.
+
+    def get_chan_current(self,
+                         arx_addr: int,
+                         chan: int,
+                         user_timeout: int = USER_TIMEOUT) -> int:
+        """Return specified channel current in Amps.
+        This current comes from the external 15V power supply.
+
+        Args
+        ----
+        arx_addr
+           ARX board address.
+        chan
+           Channel number. 0 indexed
+        user_timeout
+           User specified timeout on command. Defaults to 500ms
+
+        Returns
+        -------
+        float
+           Current for specified channel in Amps
+
+        Raises
+        ------
+        ArxException
+            Any ARX error.
+
+        """
+        self._check_channel(chan)
+        chan_adc = self._get_chan_current_adc(arx_addr, chan, user_timeout)
+        if self.input_coupling is None:
+            self.get_board_info(arx_addr, user_timeout)
+        volts = self._adc2volts(chan_adc)
+
+        return self._volts2Amps(volts, self.input_coupling[chan])
+    
+    def _get_all_chan_current_adc(self,
+                             arx_addr: int,
+                             user_timeout: int = USER_TIMEOUT) -> list:
+        """Return all channel currents.
+           See: get_chan_current() for details.
+
+        Args
+        ----
+        arx_addr
+            ARX board address.
+        user_timeout
+            User specified timeout on command. Defaults to 500ms
+
+        Returns
+        -------
+        list
+           Current for each channel in ADC units.
+
+        Raises
+        ------
+        ArxException
+            Any ARX error.
+
+        """
+        rtn = self._send(arx_addr, 'cura', '',user_timeout)
+        self._check_rtn(rtn)
+
+        return rtn['chan_current_adc']
+
     def get_all_chan_current(self,
                              arx_addr: int,
                              user_timeout: int = USER_TIMEOUT) -> list:
@@ -1717,7 +1816,7 @@ class ARX:
         Returns
         -------
         list
-           Current for each channel in ADC counts..
+           Current for each channel in Amps.
 
         Raises
         ------
@@ -1725,10 +1824,14 @@ class ARX:
             Any ARX error.
 
         """
-        rtn = self._send(arx_addr, 'cura', '',user_timeout)
-        self._check_rtn(rtn)
-
-        return rtn['chan_current_adc']
+        adc_list = self._get_all_chan_current_adc(arx_addr, user_timeout)
+        if self.input_coupling is None:
+            self.get_board_info(arx_addr, user_timeout)
+        current = []
+        for idx, adc in enumerate(adc_list):
+            volts = self._adc2volts(adc)
+            current.append(self._volts2Amps(volts, self.input_coupling[idx]))
+        return current
 
     def get_board_current(self,
                           arx_addr: int,
@@ -1821,11 +1924,11 @@ class ARX:
 
         return rtn['1wire_dev_count']
 
-    def _get_1wire_SN(self,
+    def get_1wire_SN(self,
                       arx_addr: int,
                       dev_num: int,
-                      user_timeout: int = USER_TIMEOUT) -> int:
-        """Return specified 1wire serial number
+                      user_timeout: int = USER_TIMEOUT) -> str:
+        """Return specified 1wire serial number.
 
         Args
         ----
@@ -1838,8 +1941,8 @@ class ARX:
 
         Returns
         -------
-        int
-           Serial number of 1wire device as a 64bit integer
+        str
+           Serial number of 1wire device as a 16 char hex string
 
         Raises
         ------
@@ -1848,10 +1951,12 @@ class ARX:
 
         """
 
-        rtn = self._send(arx_addr, 'owsn', '',user_timeout)
+        dev = '{:01X}'.format(dev_num)
+        rtn = self._send(arx_addr, 'owsn', dev, user_timeout)
 
         self._check_rtn(rtn, ONEWIRE_SERIAL_NUMBER_ERRORS)
-        return rtn['1wire_sn'][dev_num]
+        return rtn['1wire_sn']
+
 
     def get_1wire_temp(self,
                        arx_addr: int,
@@ -1925,7 +2030,7 @@ class ARX:
         arx_addr
            ARX Board address.
         new_brd_addr
-           Single ascii character [0x01,0x7f] other than NULL. Will be set to
+           Two ascii character [0x01,0x7e] other than NULL. Will be set to
            0x80 + new_brd_addr. Future communication must use this address.
         baud_factor
            Unsinged 16b value for setting baud rate = 16*baud_factor Hz.
@@ -1945,7 +2050,7 @@ class ARX:
             val = '{}{:04X}'.format(val, baud_factor * 16)
 
         rtn = self._send(arx_addr, 'comm', val, user_timeout)
-        self._check_rtn(rtn, None)
+        self._check_rtn(rtn, COMM_ERRORS)
         return ""
 
     def last(self, arx_addr: int, user_timeout: int = USER_TIMEOUT):

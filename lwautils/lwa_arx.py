@@ -718,11 +718,11 @@ class ARX:
         ----
         Bit definitions for 16bit configuration integer.
 
-        b0 = lowpass filter (1=wide, 0=narrow)
+        b0 = lowpass filter (0=wide, 1=narrow)
 
         b1 = signal on when b1 == b0. off otherwise
 
-        b2 = highpass filter (1=wide, 0=narrow)
+        b2 = highpass filter (0=wide, 1=narrow)
 
         b3:b8 = first attenuation (inverted) in steps of 0.5dB. Max=63(31.5dB)
 
@@ -745,9 +745,9 @@ class ARX:
             print("{:016b}".format(cfg))
 
         if verbose:
-            print("b0 = lowpass filter (1=wide, 0=narrow)")
+            print("b0 = lowpass filter (0=wide, 1=narrow)")
             print("b1 = signal on when b1 == b0. off otherwise")
-            print("b2 = highpass filter (1=wide, 0=narrow)")
+            print("b2 = highpass filter (0=wide, 1=narrow)")
             print(
                 "b3:b8 = first attenuation (inverted) in steps of 0.5dB. Max=63(31.5dB)"
             )
@@ -851,8 +851,8 @@ class ARX:
         dict
            A dictionary with the following keys:
            'sig_on':  True if signal is set to on.
-           'narrow_lpf': True. False for wide filter.
-           'narrow_hpf': True. False for wide filter.
+           'narrow_lpf': True for narrow filter. False for wide filter.
+           'narrow_hpf': True for narrow filter. False for wide filter.
            'first_atten': float 0.5dB resolution. 0-31.5.
            'second_atten': float 0.5dB resolution. 0-31.5.
            'dc_on': True if DC is on, False otherwise.
@@ -871,8 +871,8 @@ class ARX:
         """
         chan_cfg = self._get_chan_cfg(arx_addr, chan, user_timeout)
         # self._show_chan_cfg(0, chan_cfg)
-        lpf_wide = self._get_lpf(chan_cfg)
-        hpf_wide = self._get_hpf(chan_cfg)
+        lpf_narrow = self._get_lpf(chan_cfg)
+        hpf_narrow = self._get_hpf(chan_cfg)
         sig_on = self._is_sig_on(chan_cfg)
         first_atten = self._get_first_atten(chan_cfg) * ATTEN_SCALE
         second_atten = self._get_second_atten(chan_cfg) * ATTEN_SCALE
@@ -880,8 +880,8 @@ class ARX:
 
         rtn = {}
         rtn[SIG_ON] = sig_on
-        rtn[NARROW_LPF] = (lpf_wide == 0)
-        rtn[NARROW_HPF] = (hpf_wide == 0)
+        rtn[NARROW_LPF] = (lpf_narrow == 1)
+        rtn[NARROW_HPF] = (hpf_narrow == 1)
         rtn[FIRST_ATTEN] = first_atten
         rtn[SECOND_ATTEN] = second_atten
         rtn[DC_ON] = dc_on
@@ -906,8 +906,8 @@ class ARX:
            Each element in the list is
            a dictionary with the following keys:
            'sig_on':  True if signal is set to on.
-           'narrow_lpf': True. False for wide filter.
-           'narrow_hpf': True. False for wide filter.
+           'narrow_lpf': True for narrow filter. False for wide filter.
+           'narrow_hpf': True for narrow filter. False for wide filter.
            'first_atten': float 0.5dB resolution. 0-31.5.
            'second_atten': float 0.5dB resolution. 0-31.5.
            'dc_on': True if DC is on, False otherwise.
@@ -928,8 +928,8 @@ class ARX:
         #self._show_chan_cfg(0, chan_cfg)
         rtn = []
         for chan_cfg in chan_cfgs:
-            lpf_wide = self._get_lpf(chan_cfg)
-            hpf_wide = self._get_hpf(chan_cfg)
+            lpf_narrow = self._get_lpf(chan_cfg)
+            hpf_narrow = self._get_hpf(chan_cfg)
             sig_on = self._is_sig_on(chan_cfg)
             first_atten = self._get_first_atten(chan_cfg) * ATTEN_SCALE
             second_atten = self._get_second_atten(chan_cfg) * ATTEN_SCALE
@@ -937,8 +937,8 @@ class ARX:
 
             cfg = {}
             cfg[SIG_ON] = sig_on
-            cfg[NARROW_LPF] = (lpf_wide == 0)
-            cfg[NARROW_HPF] = (hpf_wide == 0)
+            cfg[NARROW_LPF] = (lpf_narrow == 1)
+            cfg[NARROW_HPF] = (hpf_narrow == 1)
             cfg[FIRST_ATTEN] = first_atten
             cfg[SECOND_ATTEN] = second_atten
             cfg[DC_ON] = dc_on

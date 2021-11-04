@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# script to deploy software. It is called by the deploy service or can be run
+# manually.
+
+pip install .

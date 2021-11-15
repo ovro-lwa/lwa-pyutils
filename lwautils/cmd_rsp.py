@@ -20,6 +20,7 @@ from pkg_resources import Requirement, resource_filename
 import dsautils.dsa_store as ds
 import dsautils.dsa_syslog as dsl
 import lwautils.TimeoutException as toe
+import lwautils.ServiceNoResponseException as snre
 
 ETCDCONF = resource_filename(Requirement.parse("lwa-pyutils"),
                              "lwautils/conf/etcdConfig.yml")
@@ -86,7 +87,7 @@ class CmdRsp:
         """
         #print('callback: key: {}'.format(event[0]))
         #print('callback: rsp: {}'.format(event[1]))
-        if event[0] == self.response_key:
+        if event[0] == self.full_response_key:
             # now look to see if cmd_id matches
             if event[1]['id'] == self.cmd_id:
                 self.response_d = event[1]
@@ -136,11 +137,12 @@ class CmdRsp:
 
         """
         self.cmd_id = self._gen_cmd_id()
-
+        self.full_response_key = self.response_key + '-' + self.cmd_id
         self.response_d = None
         cmd_dict = {}
         cmd_dict['cmd'] = cmd
         cmd_dict['id'] = self.cmd_id
+        cmd_dict['respkey'] = self.full_response_key
         val_dict = {}
         if isinstance(val, dict):
             val_dict = copy.deepcopy(val)
@@ -148,7 +150,7 @@ class CmdRsp:
             val_dict['val'] = str(val)
         cmd_dict['val'] = val_dict
 
-        watch_id = self.my_store.add_watch_prefix(self.response_key,
+        watch_id = self.my_store.add_watch_prefix(self.full_response_key,
                                                   self._mon_prefix_callback)
         self.my_store.put_dict(key, cmd_dict)
 
@@ -160,8 +162,18 @@ class CmdRsp:
             user_timeout_count += 1
 
         self.my_store.cancel(watch_id)
+
         if cmd != 'rset' and self.response_d is None:
-            # Oops, no response from service and user_timeout reached
-            raise toe.TimeoutException("User timeout reached")
+            # get data via Get
+            try:
+                self.response_d = self.my_store.get_dict(self.full_response_key)
+                if self.response_d is None:
+                    raise snre.ServiceNoResponseException()
+                self.my_store.delete(self.full_response_key)
+                return self.response_d
+            except:
+                # Oops, no response from service and user_timeout reached
+                raise snre.ServiceNoResponseException()
         else:
+            self.my_store.delete(self.full_response_key)
             return self.response_d

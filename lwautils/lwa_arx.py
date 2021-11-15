@@ -41,8 +41,9 @@ RESP_KEY_BASE = '/resp/arx/'
 MILLISECONDS = .001
 # wait for arx board to exec and push to etcd.
 CMD_TIMEOUT = 0.15  # seconds
-USER_TIMEOUT = 500 * MILLISECONDS
-ONEWIRE_TEMP_TIMEOUT = 1200 * MILLISECONDS
+USER_TIMEOUT = 15000 * MILLISECONDS
+RAW_USER_TIMEOUT = 15000 * MILLISECONDS
+ONEWIRE_TEMP_TIMEOUT = 15000 * MILLISECONDS
 
 # Required channel configuration keys
 SIG_ON = 'sig_on'
@@ -307,7 +308,7 @@ class ARX:
                 raise ARXE.ArxException("Unable to parse json error msg")
             if errors is not None and err['ERR'] == 'NAK':
                 err_msg = "{} {} - {}".format(err['ERR'], err['MSG'],
-                                              errors[err['MSG']])
+                                              errors[int(err['MSG'])])
                 raise ARXE.ArxException(err_msg)
             elif err['ERR'] != 'NAK':
                 err_msg = "{} {}".format(err['ERR'], err['MSG'])
@@ -1304,7 +1305,7 @@ class ARX:
 
         """
 
-        return get_board_sn(arx_addr, user_timeout)
+        return self.get_board_sn(arx_addr, user_timeout)
 
     def get_firmware_version(self,
                              arx_addr: int,
@@ -1402,7 +1403,7 @@ class ARX:
                     val, e_val))
         return rtn['echo']
 
-    def raw(self, arx_addr: int, cmd: str, user_timeout: int = USER_TIMEOUT) -> str:
+    def raw(self, arx_addr: int, cmd: str, user_timeout: int = RAW_USER_TIMEOUT) -> str:
         """Return byte stream for given command as Python 2 str type of hex digits. Each pair of digits represents the byte value in hex format.
 
         Args

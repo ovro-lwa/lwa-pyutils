@@ -2,5 +2,9 @@
 
 # script to deploy software. It is called by the deploy service or can be run
 # manually.
+LOG=~/deploy_lwa110-pyutils.log
+DATE="`date --iso-8601='seconds'`"
+echo "$DATE: `which python`" > $LOG
+output=`pip install .`
+echo "$DATE: $output" >> $LOG
 
-pip install .

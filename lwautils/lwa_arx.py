@@ -299,7 +299,7 @@ class ARX:
         # print("_check_rtn: rtn: {}".format(rtn))
         err_msg_json = rtn['err_str']
         if err_msg_json is None:
-            raise ARXE.ArxException("Return in None")
+            raise ARXE.ArxException("Return is None")
         if err_msg_json != "":
             try:
                 # print("_check_rtn: err_msg_json: {}".format(err_msg_json))
@@ -389,8 +389,8 @@ class ARX:
 
         return rtn
 
-    def _set_chan_cfg_lowpass_wide(self, chan: int):
-        """Set a channel's lowpass filter to wide.
+    def _set_chan_cfg_highpass_wide(self, chan: int):
+        """Set a channel's hightpass filter to wide.
 
         Note
         ----
@@ -413,8 +413,8 @@ class ARX:
         else:
             self._set_chan_cfg_signal_bit_off(chan)
 
-    def _set_chan_cfg_lowpass_narrow(self, chan: int):
-        """Set a channel's lowpass filter to narrow.
+    def _set_chan_cfg_highpass_narrow(self, chan: int):
+        """Set a channel's highpass filter to narrow.
 
         Note
         ----
@@ -515,8 +515,8 @@ class ARX:
         else:
             self.chan_cfg[chan] &= ~(1 << 1)
 
-    def _set_chan_cfg_highpass_wide(self, chan: int):
-        """Set a channel's highpass filter to wide.
+    def _set_chan_cfg_lowpass_wide(self, chan: int):
+        """Set a channel's lowpass filter to wide.
 
         Note
         ----
@@ -543,8 +543,8 @@ class ARX:
         # 1=narrow, 0=wide. 
         self.chan_cfg[chan] &= ~(1 << 2)
 
-    def _set_chan_cfg_highpass_narrow(self, chan: int):
-        """Set a channel's highpass filter to narrow.
+    def _set_chan_cfg_lowpass_narrow(self, chan: int):
+        """Set a channel's lowpass filter to narrow.
 
         Note
         ----
@@ -719,11 +719,11 @@ class ARX:
         ----
         Bit definitions for 16bit configuration integer.
 
-        b0 = lowpass filter (0=wide, 1=narrow)
+        b0 = highpass filter (0=wide, 1=narrow)
 
         b1 = signal on when b1 == b0. off otherwise
 
-        b2 = highpass filter (0=wide, 1=narrow)
+        b2 = lowpass filter (0=wide, 1=narrow)
 
         b3:b8 = first attenuation (inverted) in steps of 0.5dB. Max=63(31.5dB)
 
@@ -746,9 +746,9 @@ class ARX:
             print("{:016b}".format(cfg))
 
         if verbose:
-            print("b0 = lowpass filter (0=wide, 1=narrow)")
+            print("b0 = highpass filter (0=wide, 1=narrow)")
             print("b1 = signal on when b1 == b0. off otherwise")
-            print("b2 = highpass filter (0=wide, 1=narrow)")
+            print("b2 = lowpass filter (0=wide, 1=narrow)")
             print(
                 "b3:b8 = first attenuation (inverted) in steps of 0.5dB. Max=63(31.5dB)"
             )
@@ -947,16 +947,16 @@ class ARX:
 
         return rtn
 
-    def _get_lpf(self, chan_cfg: int) -> int:
+    def _get_hpf(self, chan_cfg: int) -> int:
         return chan_cfg & 0x01
 
-    def _get_hpf(self, chan_cfg: int) -> int:
+    def _get_lpf(self, chan_cfg: int) -> int:
         return (chan_cfg & (1 << 2)) >> 2
 
     def _is_sig_on(self, chan_cfg: int) -> bool:
-        lpf = self._get_lpf(chan_cfg)
+        hpf = self._get_hpf(chan_cfg)
         so = (chan_cfg & (1 << 1)) >> 1
-        return so == lpf
+        return so == hpf
 
     def _get_first_atten(self, chan_cfg: int) -> int:
         return ((chan_cfg ^ 0xffff) & 0x01f8) >> 3

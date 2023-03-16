@@ -1,10 +1,19 @@
 #!/bin/bash
+set -ex
 
-# script to deploy software. It is called by the deploy service or can be run
-# manually.
-LOG=~/deploy_lwa110-pyutils.log
-DATE="`date --iso-8601='seconds'`"
-echo "$DATE: `which python`" > $LOG
-output=`pip install .`
-echo "$DATE: $output" >> $LOG
+echo $HOSTNAME  # should be installing on calim
+echo $PWD  # should be base of code repo
+whoami  # should be user pipeline (or ubuntu?)
 
+# setup
+DATE=$(date --iso-8601=seconds)
+LOG=~/deploy_lwa-pyutils_$DATE.log
+
+if [[ $HOSTNAME =~ 'calim' ]]; then
+    echo "$DATE" >> $LOG 2>>$LOG
+    conda run -n datarecorder which python >> $LOG 2>>$LOG
+    conda run -n datarecorder git describe >> $LOG 2>>$LOG
+    conda run -n datarecorder pip install . >> $LOG 2>>$LOG
+else
+    echo "Not installing on this host"
+fi

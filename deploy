@@ -1,4 +1,11 @@
 #!/bin/bash
+# Distinct deployment servers
+# - gpu
+# - cal-im
+# - cr
+# Distinct environments
+# - deployment -- reliable, tested
+# - development -- testing
 
 # setup
 NAME="lwa-pyutils"
@@ -16,8 +23,12 @@ if [[ $PWD =~ $NAME ]]; then
     if [[ $HOSTNAME =~ 'calim' ]]; then
 	echo "$DATE" >> $LOG 2>>$LOG
 	conda run -n datarecorder which python >> $LOG 2>>$LOG
-	conda run -n datarecorder git describe >> $LOG 2>>$LOG
-	conda run -n datarecorder pip install . >> $LOG 2>>$LOG
+	if [[ $? == 0 ]]; then
+	    conda run -n datarecorder git describe >> $LOG 2>>$LOG
+	fi    
+	if [[ $? == 0 ]]; then
+	    conda run -n datarecorder pip install . >> $LOG 2>>$LOG
+	fi
     else
 	echo "Not installing on this host" >> $LOG 2>>$LOG
     fi
